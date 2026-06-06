@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"\nimport sys, json\ndata = json.load(sys.stdin)\nfp = data.get('tool_input', {}).get('file_path', '')\nif 'config.json' in fp:\n    print(json.dumps({'decision': 'block', 'reason': 'config.json is protected. Edit it manually to avoid pipeline accidents.'}))\n    sys.exit(0)\n\"",
+            "statusMessage": "Checking protected files..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"\nimport sys, json, subprocess\ndata = json.load(sys.stdin)\nfp = data.get('tool_input', {}).get('file_path', '')\nif fp.endswith('.py'):\n    result = subprocess.run(['ruff', 'check', '--fix', fp], capture_output=True, text=True)\n    if result.stdout.strip():\n        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': 'ruff: ' + result.stdout.strip()}}))\n\" 2>/dev/null || true",
+            "statusMessage": "Linting Python..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,567 @@
+"""
+db.py — SQLite database wrapper for photo-organizer.
+
+All DB access goes through this module. Never import sqlite3 directly
+in other modules; use Database instead.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+# ---------------------------------------------------------------------------
+# Schema (matches references/schema.sql)
+# ---------------------------------------------------------------------------
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS files (
+    file_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    path              TEXT    NOT NULL UNIQUE,
+    filename          TEXT    NOT NULL,
+    extension         TEXT    NOT NULL,
+    size_bytes        INTEGER,
+    mtime             TEXT,
+
+    file_type         TEXT    NOT NULL
+                      CHECK(file_type IN ('RAW','CAMERA_JPEG','DEV_JPEG','RESIZED_JPEG','VIDEO','UNKNOWN')),
+
+    datetime_original  TEXT,
+    datetime_digitized TEXT,
+    camera_make        TEXT,
+    camera_model       TEXT,
+    width              INTEGER,
+    height             INTEGER,
+    gps_lat            REAL,
+    gps_lon            REAL,
+    gps_alt            REAL,
+    lens_model         TEXT,
+    iso                INTEGER,
+    aperture           REAL,
+    shutter_speed      TEXT,
+    focal_length       REAL,
+    software           TEXT,
+
+    sha256             TEXT,
+    phash              INTEGER,
+
+    -- Metadata enrichment (scanned from EXIF/XMP/IPTC)
+    rating             INTEGER,   -- 0–5 star rating; NULL = not set
+    keywords           TEXT,      -- JSON array, e.g. '["Japan","Travel"]'
+    description        TEXT,      -- EXIF ImageDescription or XMP Description
+    label              TEXT,      -- XMP color label ("Red", "Yellow", …)
+
+    -- Video-specific metadata (NULL for images)
+    duration_seconds   REAL,      -- video length in seconds
+    video_codec        TEXT,      -- e.g. "avc1", "hvc1"
+    frame_rate         REAL,      -- frames per second
+
+    raw_pair_id        INTEGER REFERENCES files(file_id),
+    jpeg_pair_id       INTEGER REFERENCES files(file_id),
+
+    status             TEXT    NOT NULL DEFAULT 'pending'
+                       CHECK(status IN ('pending','scanned','hashed','flagged','confirmed','done','error')),
+    error_msg          TEXT,
+    scanned_at         TEXT,
+    updated_at         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_sha256   ON files(sha256);
+CREATE INDEX IF NOT EXISTS idx_files_phash    ON files(phash);
+CREATE INDEX IF NOT EXISTS idx_files_datetime ON files(datetime_original);
+CREATE INDEX IF NOT EXISTS idx_files_type     ON files(file_type);
+CREATE INDEX IF NOT EXISTS idx_files_status   ON files(status);
+CREATE INDEX IF NOT EXISTS idx_files_camera   ON files(camera_make, camera_model);
+
+CREATE TABLE IF NOT EXISTS duplicates (
+    dup_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id_a        INTEGER NOT NULL REFERENCES files(file_id),
+    file_id_b        INTEGER NOT NULL REFERENCES files(file_id),
+    dup_type         TEXT    NOT NULL CHECK(dup_type IN ('EXACT','NEAR')),
+    hamming_distance INTEGER,
+    keep_file_id     INTEGER REFERENCES files(file_id),
+    status           TEXT    NOT NULL DEFAULT 'pending'
+                     CHECK(status IN ('pending','reviewed','resolved')),
+    resolved_at      TEXT,
+    UNIQUE(file_id_a, file_id_b)
+);
+
+CREATE TABLE IF NOT EXISTS operations (
+    op_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id      INTEGER NOT NULL REFERENCES files(file_id),
+    op_type      TEXT    NOT NULL
+                 CHECK(op_type IN ('MOVE','RENAME','STAGE_DELETE','DELETE')),
+    source_path  TEXT    NOT NULL,
+    target_path  TEXT,
+    status       TEXT    NOT NULL DEFAULT 'planned'
+                 CHECK(status IN ('planned','confirmed','done','error','skipped')),
+    error_msg    TEXT,
+    planned_at   TEXT,
+    executed_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);
+CREATE INDEX IF NOT EXISTS idx_ops_file   ON operations(file_id);
+
+CREATE TABLE IF NOT EXISTS scan_state (
+    state_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    directory     TEXT    NOT NULL UNIQUE,
+    files_found   INTEGER DEFAULT 0,
+    files_scanned INTEGER DEFAULT 0,
+    completed     INTEGER DEFAULT 0,
+    started_at    TEXT,
+    completed_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS phases (
+    phase_name    TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK(status IN ('pending','running','complete','error')),
+    started_at    TEXT,
+    completed_at  TEXT,
+    summary_json  TEXT
+);
+
+INSERT OR IGNORE INTO phases(phase_name) VALUES
+    ('scan'),('report'),('dedup_exact'),('dedup_near'),('review'),('execute');
+
+CREATE TABLE IF NOT EXISTS run_log (
+    log_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    level     TEXT    NOT NULL CHECK(level IN ('INFO','WARN','ERROR')),
+    phase     TEXT,
+    file_id   INTEGER REFERENCES files(file_id),
+    path      TEXT,
+    message   TEXT    NOT NULL,
+    logged_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS known_cameras (
+    camera_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    make      TEXT,
+    model     TEXT NOT NULL,
+    owner     TEXT DEFAULT 'self',
+    UNIQUE(make, model)
+);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Schema migration — adds columns introduced after initial deploy
+# ---------------------------------------------------------------------------
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Idempotent: adds any missing columns to existing databases.
+    Safe to run on both fresh and already-populated DBs.
+    """
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(files)").fetchall()
+    }
+    new_cols: list[tuple[str, str]] = [
+        ("rating",           "INTEGER"),  # 0–5 star rating (XMP/EXIF Rating)
+        ("keywords",         "TEXT"),     # JSON array of keyword strings
+        ("description",      "TEXT"),     # EXIF ImageDescription / XMP Description
+        ("label",            "TEXT"),     # XMP color label
+        ("duration_seconds", "REAL"),     # video length in seconds
+        ("video_codec",      "TEXT"),     # video codec id
+        ("frame_rate",       "REAL"),     # video frames per second
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_type}")
+    conn.commit()
+
+    _migrate_filetype_check(conn)
+
+
+def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
+    """
+    SQLite cannot ALTER a CHECK constraint in place. If an existing DB was
+    created before VIDEO was an allowed file_type, rebuild the files table so
+    that inserting VIDEO rows no longer violates the constraint.
+
+    No-op on fresh DBs (SCHEMA_SQL already permits VIDEO) and on already-migrated DBs.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
+    ).fetchone()
+    if not row or not row[0] or "'DEV_JPEG'" in row[0]:
+        return  # already allows the latest file_type set
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]
+    col_list = ", ".join(cols)
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        # Recreate the canonical schema as files_new, copy data, swap.
+        new_schema = SCHEMA_SQL.replace(
+            "CREATE TABLE IF NOT EXISTS files (",
+            "CREATE TABLE files_new (",
+            1,
+        )
+        # Extract just the files_new CREATE statement (up to its closing ");").
+        start = new_schema.index("CREATE TABLE files_new (")
+        end = new_schema.index(");", start) + 2
+        conn.execute(new_schema[start:end])
+        conn.execute(
+            f"INSERT INTO files_new ({col_list}) SELECT {col_list} FROM files"
+        )
+        conn.execute("DROP TABLE files")
+        conn.execute("ALTER TABLE files_new RENAME TO files")
+        # Recreate the files indexes (idempotent).
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_files_sha256   ON files(sha256)",
+            "CREATE INDEX IF NOT EXISTS idx_files_phash    ON files(phash)",
+            "CREATE INDEX IF NOT EXISTS idx_files_datetime ON files(datetime_original)",
+            "CREATE INDEX IF NOT EXISTS idx_files_type     ON files(file_type)",
+            "CREATE INDEX IF NOT EXISTS idx_files_status   ON files(status)",
+            "CREATE INDEX IF NOT EXISTS idx_files_camera   ON files(camera_make, camera_model)",
+        ):
+            conn.execute(idx_sql)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _chunks(lst: list, size: int) -> Iterator[list]:
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
+
+
+# ---------------------------------------------------------------------------
+# Database class
+# ---------------------------------------------------------------------------
+
+class Database:
+    """Thread-safe (one connection per instance) SQLite wrapper."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._conn: sqlite3.Connection | None = None
+
+    # ---- connection --------------------------------------------------------
+
+    def connect(self) -> "Database":
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.executescript(SCHEMA_SQL)
+        _apply_migrations(self._conn)
+        return self
+
+    def close(self):
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> "Database":
+        return self.connect()
+
+    def __exit__(self, *_):
+        self.close()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database not connected. Use 'with Database(...) as db'.")
+        return self._conn
+
+    # ---- files table -------------------------------------------------------
+
+    def get_scanned_paths(self) -> set[str]:
+        """Return paths already in DB (for resume)."""
+        rows = self.conn.execute(
+            "SELECT path FROM files WHERE status != 'error'"
+        ).fetchall()
+        return {r["path"] for r in rows}
+
+    def insert_file_batch(self, rows: list[dict[str, Any]]):
+        """Insert a batch of file rows. Skips duplicates (INSERT OR IGNORE)."""
+        if not rows:
+            return
+        sql = """
+            INSERT OR IGNORE INTO files (
+                path, filename, extension, size_bytes, mtime,
+                file_type,
+                datetime_original, datetime_digitized,
+                camera_make, camera_model,
+                width, height,
+                gps_lat, gps_lon, gps_alt,
+                lens_model, iso, aperture, shutter_speed, focal_length, software,
+                rating, keywords, description, label,
+                duration_seconds, video_codec, frame_rate,
+                status, scanned_at, updated_at
+            ) VALUES (
+                :path, :filename, :extension, :size_bytes, :mtime,
+                :file_type,
+                :datetime_original, :datetime_digitized,
+                :camera_make, :camera_model,
+                :width, :height,
+                :gps_lat, :gps_lon, :gps_alt,
+                :lens_model, :iso, :aperture, :shutter_speed, :focal_length, :software,
+                :rating, :keywords, :description, :label,
+                :duration_seconds, :video_codec, :frame_rate,
+                'scanned', :scanned_at, :scanned_at
+            )
+        """
+        now = _now()
+        for row in rows:
+            row.setdefault("scanned_at", now)
+        self.conn.executemany(sql, rows)
+        self.conn.commit()
+
+    def log_error(self, path: str, message: str, phase: str = "scan"):
+        """Insert an error row for a file that failed to scan."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO files
+                (path, filename, extension, size_bytes, file_type, status, error_msg, scanned_at, updated_at)
+            VALUES (?, ?, ?, 0, 'UNKNOWN', 'error', ?, ?, ?)
+            """,
+            (path, Path(path).name, Path(path).suffix.lstrip(".").lower(),
+             message, _now(), _now()),
+        )
+        self.conn.execute(
+            "INSERT INTO run_log (level, phase, path, message, logged_at) VALUES (?,?,?,?,?)",
+            ("ERROR", phase, path, message, _now()),
+        )
+        self.conn.commit()
+
+    def count_by_status(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) as n FROM files GROUP BY status"
+        ).fetchall()
+        return {r["status"]: r["n"] for r in rows}
+
+    def count_by_type(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT file_type, COUNT(*) as n FROM files GROUP BY file_type"
+        ).fetchall()
+        return {r["file_type"]: r["n"] for r in rows}
+
+    def total_files(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+    def iter_files(
+        self,
+        file_type: str | None = None,
+        status: str | None = None,
+        batch_size: int = 500,
+    ) -> Iterator[list[sqlite3.Row]]:
+        """Yield batches of file rows for memory-efficient iteration."""
+        where_clauses = []
+        params: list[Any] = []
+        if file_type:
+            where_clauses.append("file_type = ?")
+            params.append(file_type)
+        if status:
+            where_clauses.append("status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        sql = f"SELECT * FROM files {where} ORDER BY file_id"
+
+        cursor = self.conn.execute(sql, params)
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+            yield batch
+
+    def update_file(self, file_id: int, **kwargs):
+        kwargs["updated_at"] = _now()
+        set_clause = ", ".join(f"{k} = :{k}" for k in kwargs)
+        kwargs["file_id"] = file_id
+        self.conn.execute(
+            f"UPDATE files SET {set_clause} WHERE file_id = :file_id", kwargs
+        )
+        # Don't commit here — caller batches commits for performance
+
+    def commit(self):
+        self.conn.commit()
+
+    # ---- scan_state --------------------------------------------------------
+
+    def upsert_scan_state(self, directory: str, files_found: int = 0,
+                          files_scanned: int = 0, completed: bool = False):
+        now = _now()
+        self.conn.execute(
+            """
+            INSERT INTO scan_state (directory, files_found, files_scanned, completed, started_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(directory) DO UPDATE SET
+                files_found   = excluded.files_found,
+                files_scanned = excluded.files_scanned,
+                completed     = excluded.completed,
+                completed_at  = CASE WHEN excluded.completed = 1 THEN excluded.completed_at ELSE completed_at END
+            """,
+            (directory, files_found, files_scanned, int(completed), now,
+             now if completed else None),
+        )
+        self.conn.commit()
+
+    def get_completed_directories(self) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT directory FROM scan_state WHERE completed = 1"
+        ).fetchall()
+        return {r["directory"] for r in rows}
+
+    # ---- phases ------------------------------------------------------------
+
+    def phase_complete(self, phase_name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT status FROM phases WHERE phase_name = ?", (phase_name,)
+        ).fetchone()
+        return row is not None and row["status"] == "complete"
+
+    def set_phase_status(self, phase_name: str, status: str,
+                         summary: dict | None = None):
+        now = _now()
+        self.conn.execute(
+            """
+            UPDATE phases SET status = ?, summary_json = ?,
+                started_at   = CASE WHEN ? = 'running'  THEN ? ELSE started_at   END,
+                completed_at = CASE WHEN ? = 'complete' THEN ? ELSE completed_at END
+            WHERE phase_name = ?
+            """,
+            (status, json.dumps(summary) if summary else None,
+             status, now, status, now, phase_name),
+        )
+        self.conn.commit()
+
+    # ---- duplicates --------------------------------------------------------
+
+    def insert_duplicate(self, file_id_a: int, file_id_b: int,
+                         dup_type: str, hamming: int | None = None):
+        # Normalise order so (a,b) and (b,a) are treated as same pair
+        a, b = sorted([file_id_a, file_id_b])
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO duplicates
+                (file_id_a, file_id_b, dup_type, hamming_distance)
+            VALUES (?, ?, ?, ?)
+            """,
+            (a, b, dup_type, hamming),
+        )
+
+    def count_duplicates(self, dup_type: str | None = None) -> int:
+        if dup_type:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM duplicates WHERE dup_type = ?", (dup_type,)
+            ).fetchone()[0]
+        return self.conn.execute("SELECT COUNT(*) FROM duplicates").fetchone()[0]
+
+    # ---- run_log -----------------------------------------------------------
+
+    def log(self, level: str, message: str, phase: str | None = None,
+            path: str | None = None, file_id: int | None = None):
+        self.conn.execute(
+            "INSERT INTO run_log (level, phase, file_id, path, message, logged_at) VALUES (?,?,?,?,?,?)",
+            (level, phase, file_id, path, message, _now()),
+        )
+        # Batch: caller commits periodically
+
+    # ---- known cameras -----------------------------------------------------
+
+    def add_known_camera(self, make: str | None, model: str, owner: str = "self"):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO known_cameras (make, model, owner) VALUES (?,?,?)",
+            (make, model, owner),
+        )
+        self.conn.commit()
+
+    def get_known_camera_models(self, owner: str = "self") -> set[str]:
+        """Return lowercase model strings for case-insensitive matching."""
+        rows = self.conn.execute(
+            "SELECT model FROM known_cameras WHERE owner = ?", (owner,)
+        ).fetchall()
+        return {r["model"].lower() for r in rows}
+
+    # ---- reporting helpers -------------------------------------------------
+
+    def camera_model_counts(self) -> list[tuple[str, int]]:
+        rows = self.conn.execute(
+            """
+            SELECT COALESCE(camera_model, 'Unknown') as model, COUNT(*) as n
+            FROM files GROUP BY camera_model ORDER BY n DESC
+            """
+        ).fetchall()
+        return [(r["model"], r["n"]) for r in rows]
+
+    def date_range(self) -> tuple[str | None, str | None]:
+        row = self.conn.execute(
+            "SELECT MIN(datetime_original) as mn, MAX(datetime_original) as mx FROM files"
+        ).fetchone()
+        return row["mn"], row["mx"]
+
+    def no_exif_date_count(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE datetime_original IS NULL"
+        ).fetchone()[0]
+
+    def ratings_distribution(self) -> dict[int | None, int]:
+        """Return count per rating value (0–5, plus None = unrated)."""
+        rows = self.conn.execute(
+            "SELECT rating, COUNT(*) as n FROM files GROUP BY rating"
+        ).fetchall()
+        return {r["rating"]: r["n"] for r in rows}
+
+    def top_keywords(self, limit: int = 20) -> list[tuple[str, int]]:
+        """
+        Return (keyword, count) pairs for the most-used keywords.
+        Explodes the JSON array stored in the keywords column.
+        Requires SQLite ≥ 3.38 for json_each; falls back gracefully.
+        """
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT value AS kw, COUNT(*) AS n
+                FROM files, json_each(files.keywords)
+                WHERE files.keywords IS NOT NULL
+                GROUP BY value
+                ORDER BY n DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [(r["kw"], r["n"]) for r in rows]
+        except Exception:
+            return []   # json_each not available — skip silently
+
+    def has_any_metadata_field(self) -> bool:
+        """Quick check: do any files have rating / keywords / label?"""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM files "
+            "WHERE rating IS NOT NULL OR keywords IS NOT NULL OR label IS NOT NULL"
+        ).fetchone()
+        return row[0] > 0
+
+    def resolution_buckets(self) -> dict[str, int]:
+        """JPEG resolution distribution."""
+        gt4000 = self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_type != 'RAW' AND width > 4000"
+        ).fetchone()[0]
+        mid = self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_type != 'RAW' AND width BETWEEN 1000 AND 4000"
+        ).fetchone()[0]
+        small = self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_type != 'RAW' AND width < 1000 AND width > 0"
+        ).fetchone()[0]
+        return {">4000px": gt4000, "1000–4000px": mid, "<1000px": small}

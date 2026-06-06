@@ -1,0 +1,24 @@
+{
+    "_comment": "Copy this to config.json and fill in your paths. Remove this _comment line.",
+
+    "db": "C:/photos.db",
+
+    "target": "E:/Organised",
+
+    "input_dirs": [
+        "E:/Photos/2018-2022",
+        "D:/Backup/Camera"
+    ],
+
+    "workers": 4,
+
+    "hamming_threshold": 8,
+
+    "use_secondary_signals": false,
+
+    "known_cameras": [
+        { "make": "Sony",  "model": "ILCE-7RM2"      },
+        { "make": "Sony",  "model": "ILCE-7M4"        },
+        { "make": "Apple", "model": "iPhone 14 Pro"   }
+    ]
+}
