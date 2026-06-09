@@ -358,8 +358,25 @@ def _open_images(members: list[int], meta: dict) -> None:
     console.print(f"  [dim]Opened {opened} image(s) in your default viewer.[/dim]")
 
 
-def review_near_dupes(db: Database) -> None:
-    """Interactive near-duplicate review, one CLUSTER at a time."""
+def _has_samename_dupes(members: list[int], meta: dict) -> bool:
+    """True if the cluster still has >=2 copies sharing a filename stem
+    (genuine same-image duplicates that auto-resolve would handle)."""
+    seen: set[str] = set()
+    for f in members:
+        s = _norm_stem(meta[f]["filename"])
+        if s in seen:
+            return True
+        seen.add(s)
+    return False
+
+
+def review_near_dupes(db: Database, review_all: bool = False) -> None:
+    """Interactive near-duplicate review, one CLUSTER at a time.
+
+    By default this skips clusters made up purely of DISTINCT look-alike images
+    (consecutive/burst shots with different filenames) — those are kept and
+    never deleted unless you ask.  Pass review_all=True to walk every cluster.
+    """
     print_phase_header("3B review", "Near-Duplicate Review")
 
     clusters, meta, cluster_h = _build_near_clusters(db)
@@ -368,6 +385,35 @@ def review_near_dupes(db: Database) -> None:
         return
 
     known = db.get_known_camera_models()
+
+    # Split pending clusters: same-name dupes (resolvable) vs distinct look-alikes.
+    samename = [m for m in clusters if _has_samename_dupes(m, meta)]
+    distinct = [m for m in clusters if not _has_samename_dupes(m, meta)]
+
+    if not review_all:
+        # Default: do NOT dump the burst queue. Summarise and advise.
+        if samename:
+            print_warning(
+                f"{len(samename):,} clusters still have same-name duplicate "
+                "copies. Resolve them automatically (safe, no burst shots "
+                "touched):\n      python -m photo_organizer review --auto --commit"
+            )
+        if distinct:
+            console.print(
+                f"\n  {len(distinct):,} clusters are [bold]distinct look-alikes[/bold] "
+                "(e.g. consecutive / burst shots with different filenames).\n"
+                "  These are [green]kept by default[/green] — nothing is deleted.\n"
+                "  To walk through them one by one anyway:  "
+                "[cyan]review --all[/cyan]\n"
+            )
+        print_success(
+            "Near-dupe review is optional. To keep everything as-is and move on, "
+            "just run [cyan]plan[/cyan] next — only same-name redundant copies "
+            "(via --auto) are staged for deletion."
+        )
+        return
+
+    # review_all: walk every pending cluster.
     # Order: most-similar (lowest hamming) clusters first, larger groups first.
     clusters.sort(key=lambda mem: (cluster_h.get(mem[0], 0), -len(mem)))
 

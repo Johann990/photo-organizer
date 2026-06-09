@@ -372,29 +372,35 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
             stage_ids.add(row["file_id"])
 
     # 1b. Exact duplicate non-keepers
+    # Heavily-mirrored libraries can have 100k+ exact groups, so this must stay
+    # O(N): bulk-load metadata once and pick keepers in memory. We do NOT write
+    # duplicates.keep_file_id for EXACT — it is never read back (staging is driven
+    # by stage_ids), and the old per-group UPDATE scanned the whole duplicates
+    # table once per group (O(groups × rows) → hours on big mirrors).
     known_cameras = db.get_known_camera_models()
     with console.status("Resolving exact duplicate groups…"):
         groups = _exact_dup_groups(db)
         dup_keepers: set[int] = set()
         dup_non_keepers: set[int] = set()
 
+        member_ids = [fid for g in groups for fid in g]
+        meta: dict[int, Any] = {}
+        for i in range(0, len(member_ids), 900):
+            chunk = member_ids[i:i + 900]
+            ph = ",".join("?" * len(chunk))
+            for r in db.conn.execute(
+                f"SELECT file_id, path, width, height, size_bytes, camera_model "
+                f"FROM files WHERE file_id IN ({ph})", chunk
+            ):
+                meta[r["file_id"]] = r
+
         for group in groups:
-            keeper = _pick_keeper(db, group, known_cameras)
+            keeper = max(group, key=lambda f: keep_score(meta[f], known_cameras))
             dup_keepers.add(keeper)
             for fid in group:
                 if fid != keeper:
                     dup_non_keepers.add(fid)
                     stage_ids.add(fid)
-            # Record the keeper in the duplicates table
-            ph = ",".join("?" * len(group))
-            db.conn.execute(
-                f"UPDATE duplicates SET keep_file_id = ? "
-                f"WHERE dup_type = 'EXACT' "
-                f"  AND (file_id_a IN ({ph}) OR file_id_b IN ({ph}))",
-                [keeper] + group + group,
-            )
-
-        db.commit()
 
     # 1c. Near-duplicate losers the user marked for deletion in `review`.
     # The reviewer only records the decision (duplicates.status='reviewed' +

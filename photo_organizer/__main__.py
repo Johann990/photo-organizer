@@ -194,7 +194,7 @@ def cmd_review(args):
             auto_resolve_near_dupes(db, commit=getattr(args, "commit", False))
         else:
             from .reviewer import review_near_dupes
-            review_near_dupes(db)
+            review_near_dupes(db, review_all=getattr(args, "all", False))
 
 
 def cmd_unknown_cameras(args):
@@ -351,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument(
         "--commit", action="store_true",
         help="With --auto: actually record the auto-decisions (default: dry-run)",
+    )
+    p_review.add_argument(
+        "--all", action="store_true",
+        help="Manual review: also walk distinct look-alike (burst) clusters "
+             "(default skips them — they are kept)",
     )
     p_review.set_defaults(func=cmd_review)
 
