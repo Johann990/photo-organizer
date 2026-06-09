@@ -94,10 +94,11 @@ python -m photo_organizer reclassify      --config config.json   # DB-only
 | `CAMERA_JPEG` | Straight-out-of-camera JPEG (no editing software tag) |
 | `DEV_JPEG` | Developed/edited JPEG — Software tag matches Lightroom, Capture One, darktable, Photoshop … |
 | `RESIZED_JPEG` | Export/resized copy — path contains "resized" (+ secondary signals) |
+| `HEIC` | iPhone default (heic/heif) — full EXIF; organized like a photo into Masters/Others |
 | `VIDEO` | mp4/mov/m4v/avi/mkv/wmv/flv/webm/mts/m2ts/3gp/mpg |
-| `UNKNOWN` | Everything else (HEIC, PNG, TIFF, unrecognised …) |
+| `UNKNOWN` | Everything else (PNG, TIFF, WEBP, unrecognised …) — left in place |
 
-`DEV_JPEG` destination = same as `CAMERA_JPEG` (Masters/Others), just labelled differently.  
+`DEV_JPEG` / `HEIC` destination = same as `CAMERA_JPEG` (Masters/Others), just labelled differently.  
 After changing classifier rules: `reclassify` updates the DB in seconds without re-scanning.
 
 ---
@@ -118,6 +119,8 @@ After changing classifier rules: `reclassify` updates the DB in seconds without 
 - `{event}` = source parent folder name (sanitised). Omitted when it is a date/serial/drive-root.
 - Span > 30 days → falls back to per-day folders + WARN in run_log.
 - Name collisions → `_conflict_N` suffix + WARN in run_log.
+- No EXIF date → date taken from filesystem **mtime** (WARN in run_log); only truly date-less files go to `NoDate/`.
+- **`review` → `plan`**: `review` records near-dupe decisions in the `duplicates` table only; `plan` reads them and creates the `STAGE_DELETE`. Run `review` before `plan` (or re-run `plan`). `plan --force` won't wipe review decisions.
 
 ---
 

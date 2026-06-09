@@ -188,9 +188,13 @@ def cmd_undo(args):
 
 def cmd_review(args):
     cfg = _load_cfg(args)
-    from .reviewer import review_near_dupes
     with Database(_db_path(args, cfg)) as db:
-        review_near_dupes(db)
+        if getattr(args, "auto", False):
+            from .reviewer import auto_resolve_near_dupes
+            auto_resolve_near_dupes(db, commit=getattr(args, "commit", False))
+        else:
+            from .reviewer import review_near_dupes
+            review_near_dupes(db)
 
 
 def cmd_unknown_cameras(args):
@@ -337,7 +341,16 @@ def build_parser() -> argparse.ArgumentParser:
     # review
     p_review = sub.add_parser(
         "review", parents=[shared],
-        help="Interactive near-duplicate review (Phase 3B follow-up)",
+        help="Near-duplicate review (Phase 3B follow-up); cluster-based",
+    )
+    p_review.add_argument(
+        "--auto", action="store_true",
+        help="Cluster near-dupes and auto-resolve unambiguous groups "
+             "(dry-run preview unless --commit)",
+    )
+    p_review.add_argument(
+        "--commit", action="store_true",
+        help="With --auto: actually record the auto-decisions (default: dry-run)",
     )
     p_review.set_defaults(func=cmd_review)
 

@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS files (
     mtime             TEXT,
 
     file_type         TEXT    NOT NULL
-                      CHECK(file_type IN ('RAW','CAMERA_JPEG','DEV_JPEG','RESIZED_JPEG','VIDEO','UNKNOWN')),
+                      CHECK(file_type IN ('RAW','CAMERA_JPEG','DEV_JPEG','RESIZED_JPEG','VIDEO','HEIC','UNKNOWN')),
 
     datetime_original  TEXT,
     datetime_digitized TEXT,
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS files (
     software           TEXT,
 
     sha256             TEXT,
-    phash              INTEGER,
+    phash              TEXT,      -- perceptual hash as 16-char hex (imagehash str)
 
     -- Metadata enrichment (scanned from EXIF/XMP/IPTC)
     rating             INTEGER,   -- 0–5 star rating; NULL = not set
@@ -189,15 +189,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
     """
     SQLite cannot ALTER a CHECK constraint in place. If an existing DB was
-    created before VIDEO was an allowed file_type, rebuild the files table so
-    that inserting VIDEO rows no longer violates the constraint.
+    created before newer file_types (VIDEO, DEV_JPEG, HEIC) were allowed,
+    rebuild the files table so inserting those rows no longer violates the
+    constraint.  The newest type ('HEIC') acts as the up-to-date sentinel.
 
-    No-op on fresh DBs (SCHEMA_SQL already permits VIDEO) and on already-migrated DBs.
+    No-op on fresh DBs (SCHEMA_SQL already permits HEIC) and on already-migrated DBs.
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
     ).fetchone()
-    if not row or not row[0] or "'DEV_JPEG'" in row[0]:
+    if not row or not row[0] or "'HEIC'" in row[0]:
         return  # already allows the latest file_type set
 
     cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]

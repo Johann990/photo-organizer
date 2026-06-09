@@ -48,6 +48,33 @@ def _parse_exif_dt(s: str | None) -> datetime | None:
     return None
 
 
+def _parse_mtime(s: str | None) -> datetime | None:
+    """
+    Parse the stored filesystem mtime (ISO-8601, e.g. '2023-06-15T10:30:00+00:00').
+    Used only as a LAST-RESORT date when a file has no EXIF date — mtime can be
+    unreliable (copying may reset it), so it is preferred over NoDate/ but always
+    logged.  Returns a naive datetime (tz dropped) to match _parse_exif_dt.
+    """
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=None)
+
+
+def _effective_date(row: Any) -> tuple[datetime | None, bool]:
+    """
+    Resolve a file's date: EXIF datetime first, else filesystem mtime.
+    Returns (datetime_or_None, used_mtime).
+    """
+    dt = _parse_exif_dt(row["datetime_original"])
+    if dt is not None:
+        return dt, False
+    return _parse_mtime(row["mtime"]), True
+
+
 def _sanitize_camera(model: str | None) -> str:
     """Return a filesystem-safe, truncated camera model string."""
     if not model:
@@ -128,7 +155,7 @@ def _compute_event_spans(db: Database, stage_ids: set[int]) -> dict[str, dict]:
         for row in batch:
             if row["status"] == "error" or row["file_id"] in stage_ids:
                 continue
-            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG"):
+            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
                 continue  # videos use their own layout; UNKNOWN stays in place
             dt = _parse_exif_dt(row["datetime_original"])
             if dt is None:
@@ -154,19 +181,29 @@ def _compute_event_spans(db: Database, stage_ids: set[int]) -> dict[str, dict]:
     return spans
 
 
-def _path_richness(path: str) -> int:
+def keep_score(row: Any, known_cameras: set[str]) -> tuple:
+    """Rank duplicate copies; the highest tuple is the one to KEEP.
+
+    Shared by exact-duplicate resolution (planner) and near-duplicate review
+    (reviewer) so a single, consistent policy decides which copy survives —
+    whether the relationship is recorded as EXACT or NEAR.
+
+    Order (user-chosen):
+      1. highest resolution            (best image wins; ties for exact copies)
+      2. largest file size             (least re-compressed)
+      3. known-camera / Masters folder (camera_model in known_cameras)
+      4. real event-name parent folder (not a date/serial/camera-dump name)
+      5. shortest path                 (main location over deep backup)
+      6. lowest file_id                (deterministic final tiebreak)
     """
-    Score how 'organised' a path looks — more components and year/month
-    folder names score higher.  Used to pick which copy to keep.
-    """
-    p = Path(path)
-    score = len(p.parts)
-    for part in p.parts:
-        if re.fullmatch(r"\d{4}", part):          # bare year folder
-            score += 3
-        elif re.fullmatch(r"\d{4}-\d{2}", part):  # year-month folder
-            score += 3
-    return score
+    area = (row["width"] or 0) * (row["height"] or 0)
+    model = (row["camera_model"] or "").lower()
+    in_known = 1 if (model and model in known_cameras) else 0
+    parent = Path(row["path"]).parent.name
+    has_event = 1 if (not _is_unorganised_folder_name(parent)
+                      and _sanitize_event(parent)) else 0
+    return (area, row["size_bytes"] or 0, in_known, has_event,
+            -len(row["path"]), -row["file_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +245,14 @@ def _exact_dup_groups(db: Database) -> list[list[int]]:
     return [g for g in groups.values() if len(g) > 1]
 
 
-def _pick_keeper(db: Database, group: list[int]) -> int:
-    """Return the file_id with the richest (most organised) path."""
+def _pick_keeper(db: Database, group: list[int], known_cameras: set[str]) -> int:
+    """Return the file_id to KEEP, per the shared keep_score policy."""
     ph = ",".join("?" * len(group))
     rows = db.conn.execute(
-        f"SELECT file_id, path FROM files WHERE file_id IN ({ph})", group
+        f"SELECT file_id, path, width, height, size_bytes, camera_model "
+        f"FROM files WHERE file_id IN ({ph})", group
     ).fetchall()
-    return max(rows, key=lambda r: _path_richness(r["path"]))["file_id"]
+    return max(rows, key=lambda r: keep_score(r, known_cameras))["file_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +289,7 @@ def _build_target_path(
     (it appends _conflict_N when a destination already exists).
     """
     ext = (row["extension"] or "jpg").upper()
-    dt = _parse_exif_dt(row["datetime_original"])
+    dt, _ = _effective_date(row)  # EXIF date, else filesystem mtime fallback
 
     # ── Videos: dedicated tree, date-only, event = source parent folder ──────
     if row["file_type"] == "VIDEO":
@@ -334,13 +372,14 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
             stage_ids.add(row["file_id"])
 
     # 1b. Exact duplicate non-keepers
+    known_cameras = db.get_known_camera_models()
     with console.status("Resolving exact duplicate groups…"):
         groups = _exact_dup_groups(db)
         dup_keepers: set[int] = set()
         dup_non_keepers: set[int] = set()
 
         for group in groups:
-            keeper = _pick_keeper(db, group)
+            keeper = _pick_keeper(db, group, known_cameras)
             dup_keepers.add(keeper)
             for fid in group:
                 if fid != keeper:
@@ -357,6 +396,49 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
 
         db.commit()
 
+    # 1c. Near-duplicate losers the user marked for deletion in `review`.
+    # The reviewer only records the decision (duplicates.status='reviewed' +
+    # keep_file_id); we derive the loser here and stage it.  Doing it in plan
+    # (rather than in the reviewer) means a `plan --force` rebuild cannot wipe
+    # the decision, and the loser never also receives a MOVE op.
+    near_dup_losers: set[int] = set()
+    for r in db.conn.execute(
+        "SELECT file_id_a, file_id_b, keep_file_id FROM duplicates "
+        "WHERE dup_type = 'NEAR' AND status = 'reviewed' AND keep_file_id IS NOT NULL"
+    ).fetchall():
+        loser = r["file_id_a"] if r["keep_file_id"] == r["file_id_b"] else r["file_id_b"]
+        near_dup_losers.add(loser)
+        stage_ids.add(loser)
+
+    # 1d. Safety net — never stage EVERY byte-identical copy of a file.
+    # EXACT and NEAR resolution choose keepers independently, so their staging
+    # sets can overlap in a way that stages all copies of one sha256 group
+    # (e.g. a NEAR loser that is also another group's only EXACT survivor).
+    # Guarantee each sha256 group retains its best copy; rescue + log any group
+    # found fully staged.  This also protects every NEAR keeper's content,
+    # because a staged keeper always has a byte-identical twin kept here.
+    sha_groups: dict[str, list[int]] = defaultdict(list)
+    for r in db.conn.execute(
+        "SELECT file_id, sha256 FROM files WHERE sha256 IS NOT NULL"
+    ).fetchall():
+        sha_groups[r["sha256"]].append(r["file_id"])
+    rescued = 0
+    for fids in sha_groups.values():
+        if all(f in stage_ids for f in fids):
+            keeper = _pick_keeper(db, fids, known_cameras)
+            stage_ids.discard(keeper)
+            near_dup_losers.discard(keeper)
+            dup_non_keepers.discard(keeper)
+            rescued += 1
+    if rescued:
+        db.log(
+            "WARN",
+            f"{rescued} sha256 group(s) were fully staged by overlapping "
+            "EXACT/NEAR decisions; kept the best copy of each to prevent loss.",
+            phase="review",
+        )
+        db.commit()
+
     # ── 2. Near-duplicate stats (info only — never auto-staged) ──────────────
     near_pairs: int = db.conn.execute(
         "SELECT COUNT(*) FROM duplicates WHERE dup_type = 'NEAR' AND status = 'pending'"
@@ -371,10 +453,10 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
 
     # ── 3. Build all operations in one pass ───────────────────────────────────
     staging_root = target_root / "_staging" / "to_delete"
-    known_cameras = db.get_known_camera_models()
     counters: dict[tuple, int] = {}
     now = _now()
     ops: list[dict] = []
+    mtime_fallback = 0   # files dated from filesystem mtime (no EXIF date)
 
     # Pre-measure multi-day events so each source folder maps to one event folder.
     with console.status("Measuring event date spans…"):
@@ -401,6 +483,9 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
             else:
                 if row["file_type"] == "UNKNOWN":
                     continue  # leave truly-unknown files in place
+                _dt, used_mtime = _effective_date(row)
+                if used_mtime and _dt is not None:
+                    mtime_fallback += 1
                 target = _build_target_path(
                     row, target_root, known_cameras, counters, event_spans
                 )
@@ -445,6 +530,16 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
             )
         db.commit()
 
+    # ── 3c. Files dated from filesystem mtime (no EXIF date) ──────────────────
+    if mtime_fallback:
+        db.log(
+            "WARN",
+            f"{mtime_fallback} files had no EXIF date — dated from filesystem "
+            "mtime instead (may be inaccurate if files were copied).",
+            phase="review",
+        )
+        db.commit()
+
     # ── 4. Summary stats ─────────────────────────────────────────────────────
     resized_n: int = db.conn.execute(
         "SELECT COUNT(*) FROM files WHERE file_type = 'RESIZED_JPEG'"
@@ -479,11 +574,23 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
         f"{len(dup_non_keepers):,}",
         "SHA-256 match, inferior path kept",
     )
+    if near_dup_losers:
+        t.add_row(
+            "[red]Stage for deletion — Near-dupes (reviewed)[/red]",
+            f"{len(near_dup_losers):,}",
+            "your keep/discard choices from 'review'",
+        )
     t.add_row(
         "[green]Move + rename → Masters/ or Others/[/green]",
         f"{move_n:,}",
         "renamed by date/camera",
     )
+    if mtime_fallback:
+        t.add_row(
+            "[dim]  ↳ of which dated by file mtime[/dim]",
+            f"{mtime_fallback:,}",
+            "no EXIF date — mtime fallback",
+        )
     if near_pairs:
         t.add_row(
             "[yellow]Near-duplicates (needs review)[/yellow]",

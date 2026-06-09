@@ -263,8 +263,9 @@ def execute(
     if errors == 0 and skipped == 0:
         print_success(
             f"All {done:,} operations completed successfully. "
-            f"No data was permanently deleted — "
-            f"staged files live in _staging/to_delete/ for 30 days before final removal."
+            f"No data was permanently deleted — staged files sit in "
+            f"_staging/to_delete/. Review them, then delete that folder yourself "
+            f"once you're happy with the result."
         )
     else:
         if errors:

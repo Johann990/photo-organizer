@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS files (
 
     -- Hashes (computed locally, not from drive every time)
     sha256           TEXT,                    -- exact duplicate detection
-    phash            INTEGER,                 -- perceptual hash (imagehash int64)
+    phash            TEXT,                    -- perceptual hash as 16-char hex (imagehash str)
 
     -- Pairing
     raw_pair_id      INTEGER REFERENCES files(file_id),  -- JPEG → its RAW partner
