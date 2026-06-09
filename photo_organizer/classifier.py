@@ -1,8 +1,8 @@
 """
 classifier.py — File type classification logic.
 
-Determines whether a file is RAW, CAMERA_JPEG, RESIZED_JPEG, or UNKNOWN.
-Rules are applied in priority order; first match wins.
+Determines whether a file is RAW, VIDEO, HEIC, DEV_JPEG, CAMERA_JPEG,
+RESIZED_JPEG, or UNKNOWN.  Rules are applied in priority order; first match wins.
 """
 
 from __future__ import annotations
@@ -51,6 +51,12 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset({
     "mp4", "mov", "m4v", "avi", "mkv", "wmv", "flv", "webm",
     "mts", "m2ts", "3gp", "3g2", "mpg", "mpeg",
 })
+
+# ---------------------------------------------------------------------------
+# HEIC / HEIF (modern iPhone default) — full EXIF, organized like photos
+# ---------------------------------------------------------------------------
+
+HEIC_EXTENSIONS: frozenset[str] = frozenset({"heic", "heif"})
 
 # ---------------------------------------------------------------------------
 # Resized signals
@@ -113,7 +119,8 @@ RESIZED_WIDTH_THRESHOLD = 2500
 
 class FileClassifier:
     """
-    Classify a file as RAW, CAMERA_JPEG, RESIZED_JPEG, or UNKNOWN.
+    Classify a file as RAW, VIDEO, HEIC, DEV_JPEG, CAMERA_JPEG,
+    RESIZED_JPEG, or UNKNOWN.
 
     Parameters
     ----------
@@ -135,7 +142,7 @@ class FileClassifier:
 
     def classify(self, path: Path, exif: dict) -> str:
         """
-        Return one of: 'RAW', 'VIDEO', 'DEV_JPEG', 'CAMERA_JPEG',
+        Return one of: 'RAW', 'VIDEO', 'HEIC', 'DEV_JPEG', 'CAMERA_JPEG',
         'RESIZED_JPEG', 'UNKNOWN'
         """
         ext = path.suffix.lstrip(".").lower()
@@ -147,6 +154,11 @@ class FileClassifier:
         # ── Rule 1b: Video extension ───────────────────────────────────────
         if ext in VIDEO_EXTENSIONS:
             return "VIDEO"
+
+        # ── Rule 1c: HEIC/HEIF (iPhone default) ────────────────────────────
+        # Camera-origin with full EXIF (date/model); organized like a photo.
+        if ext in HEIC_EXTENSIONS:
+            return "HEIC"
 
         # ── Rule 2: Not a JPEG at all → UNKNOWN ───────────────────────────
         if ext not in JPEG_EXTENSIONS:

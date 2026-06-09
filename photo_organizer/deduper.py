@@ -63,17 +63,21 @@ def _hash_file_row(row) -> tuple[int, str, str | None]:
 # pHash helpers
 # ---------------------------------------------------------------------------
 
-def _phash_file(path: Path) -> int | None:
-    """Compute perceptual hash. Returns int64 or None on error."""
+def _phash_file(path: Path) -> str | None:
+    """Compute perceptual hash. Returns a 16-char hex string or None on error.
+
+    Stored verbatim as TEXT — imagehash's native str() output is an unsigned
+    64-bit value in hex, which sidesteps SQLite's signed-INTEGER overflow.
+    """
     try:
         with Image.open(path) as img:
             img.thumbnail((64, 64))          # resize before hashing = faster
-            return int(str(imagehash.phash(img)), 16)
+            return str(imagehash.phash(img))
     except Exception:
         return None
 
 
-def _phash_file_row(row) -> tuple[int, str, int | None]:
+def _phash_file_row(row) -> tuple[int, str, str | None]:
     return row["file_id"], row["path"], _phash_file(Path(row["path"]))
 
 
@@ -212,8 +216,8 @@ def dedup_near(
 
     phashed = 0
     errors = 0
-    # phash (int) → list of file_ids — for near-dup comparison
-    phash_index: dict[int, list[int]] = {}
+    # phash (16-char hex str) → list of file_ids — for near-dup comparison
+    phash_index: dict[str, list[int]] = {}
 
     # Pre-load existing phashes
     for batch in db.iter_files(file_type="CAMERA_JPEG"):
@@ -252,6 +256,9 @@ def dedup_near(
     # For 50k+ JPEGs a full O(n²) compare is too slow.
     # Strategy: group by identical phash first (free), then compare
     # within a sliding window sorted by phash value for close hashes.
+    # The keys are fixed-width (16-char) zero-padded hex strings, so a
+    # lexicographic sort is numerically identical to sorting the underlying
+    # ints — the sliding-window assumption still holds.
     near_pairs = 0
     with console.status("Finding near duplicate pairs (Hamming distance)…"):
         phash_list = sorted(phash_index.keys())
@@ -273,7 +280,7 @@ def dedup_near(
             # for many real-world cases — not perfect but fast)
             for j in range(i + 1, min(i + 200, n)):
                 ph_b = phash_list[j]
-                hamming = bin(ph_a ^ ph_b).count("1")
+                hamming = bin(int(ph_a, 16) ^ int(ph_b, 16)).count("1")
                 if hamming > hamming_threshold:
                     break   # sorted order means later ones will be farther
                 for id_a in ids_a:
@@ -298,5 +305,5 @@ def dedup_near(
     if near_pairs:
         print_warning(
             f"{near_pairs:,} near-duplicate pairs require human review before deletion.\n"
-            "  Run: python -m photo_organizer review --near-dupes --db <path>"
+            "  Run: python -m photo_organizer review --db <path>"
         )

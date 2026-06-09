@@ -42,7 +42,7 @@ def report(db: Database) -> dict:
     overview.add_column("Count",      justify="right")
     overview.add_column("% of total", justify="right")
 
-    type_order = ["RAW", "CAMERA_JPEG", "DEV_JPEG", "RESIZED_JPEG", "VIDEO", "UNKNOWN"]
+    type_order = ["RAW", "CAMERA_JPEG", "DEV_JPEG", "RESIZED_JPEG", "HEIC", "VIDEO", "UNKNOWN"]
     for ft in type_order:
         n = by_type.get(ft, 0)
         pct = n / total * 100 if total else 0
