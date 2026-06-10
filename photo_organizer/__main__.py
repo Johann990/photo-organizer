@@ -176,7 +176,16 @@ def cmd_execute(args):
             camera=getattr(args, "camera", None),
             software=getattr(args, "software", None),
             file_type=getattr(args, "type", None),
+            skip_preflight=getattr(args, "skip_preflight", False),
         )
+
+
+def cmd_reconcile(args):
+    cfg = _load_cfg(args)
+    from .reconcile import reconcile
+    with Database(_db_path(args, cfg)) as db:
+        ok = reconcile(db, verify_disk=getattr(args, "verify_disk", False))
+    sys.exit(0 if ok else 1)
 
 
 def cmd_undo(args):
@@ -310,7 +319,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--type", metavar="FILE_TYPE",
         help="Only move this file_type (RAW / CAMERA_JPEG / DEV_JPEG / RESIZED_JPEG / VIDEO)",
     )
+    p_exec.add_argument(
+        "--skip-preflight", action="store_true",
+        help="Bypass the up-front same-volume / writability gate (power users)",
+    )
     p_exec.set_defaults(func=cmd_execute)
+
+    # reconcile
+    p_recon = sub.add_parser(
+        "reconcile", parents=[shared],
+        help="Conservation proof: prove every scanned file is in exactly one "
+             "terminal state (balance sheet; UNACCOUNTED must be 0)",
+    )
+    p_recon.add_argument(
+        "--verify-disk", action="store_true",
+        help="Also confirm each moved/staged file still exists on disk "
+             "(I/O; flags any 'done' file missing from its claimed location)",
+    )
+    p_recon.set_defaults(func=cmd_reconcile)
 
     # undo
     p_undo = sub.add_parser(
