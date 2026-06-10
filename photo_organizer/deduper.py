@@ -18,6 +18,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image
 
+from .bktree import BKTree
 from .db import Database
 from .progress import (
     PhaseProgress,
@@ -253,36 +254,36 @@ def dedup_near(
     db.commit()
 
     # ── Find near-duplicate pairs via Hamming distance ─────────────────────
-    # For 50k+ JPEGs a full O(n²) compare is too slow.
-    # Strategy: group by identical phash first (free), then compare
-    # within a sliding window sorted by phash value for close hashes.
-    # The keys are fixed-width (16-char) zero-padded hex strings, so a
-    # lexicographic sort is numerically identical to sorting the underlying
-    # ints — the sliding-window assumption still holds.
+    # pHash Hamming distance is a metric, so a BK-tree answers
+    # "all hashes within `hamming_threshold` of x" with ZERO false negatives,
+    # visiting only ~O(log N) nodes per query. This replaces an earlier
+    # sorted-sliding-window heuristic that silently missed near-dupes whose
+    # high-order pHash bits differed (e.g. 0x0…0 vs 0x8…0 are Hamming-1 yet
+    # sort to opposite ends). See tests/test_bktree.py for the counterexample.
     near_pairs = 0
     with console.status("Finding near duplicate pairs (Hamming distance)…"):
-        phash_list = sorted(phash_index.keys())
-        n = len(phash_list)
+        # Distinct 16-char hex pHash → its 64-bit int value.
+        ph_by_int: dict[int, str] = {int(ph, 16): ph for ph in phash_index}
 
-        for i in range(n):
-            ph_a = phash_list[i]
+        tree = BKTree()
+        tree.add_many(ph_by_int.keys())
+
+        for a_int, ph_a in ph_by_int.items():
             ids_a = phash_index[ph_a]
 
-            # Same hash = exact perceptual match
+            # Same hash = exact perceptual match (Hamming 0)
             if len(ids_a) > 1:
                 for x in range(len(ids_a)):
                     for y in range(x + 1, len(ids_a)):
                         db.insert_duplicate(ids_a[x], ids_a[y], "NEAR", 0)
                         near_pairs += 1
 
-            # Compare against nearby hashes in sorted order
-            # (hashes differing by ≤ hamming_threshold bits are numerically close
-            # for many real-world cases — not perfect but fast)
-            for j in range(i + 1, min(i + 200, n)):
-                ph_b = phash_list[j]
-                hamming = bin(int(ph_a, 16) ^ int(ph_b, 16)).count("1")
-                if hamming > hamming_threshold:
-                    break   # sorted order means later ones will be farther
+            # All distinct hashes within the threshold — no false negatives.
+            for b_int, hamming in tree.query(a_int, hamming_threshold):
+                # Emit each unordered pair once; skip self (==) and reverse (<).
+                if b_int <= a_int:
+                    continue
+                ph_b = ph_by_int[b_int]
                 for id_a in ids_a:
                     for id_b in phash_index[ph_b]:
                         db.insert_duplicate(id_a, id_b, "NEAR", hamming)
