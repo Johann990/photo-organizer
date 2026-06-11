@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,15 +64,182 @@ def _parse_mtime(s: str | None) -> datetime | None:
     return dt.replace(tzinfo=None)
 
 
+# ---------------------------------------------------------------------------
+# Date forensics — filename-embedded timestamps + confidence-rated resolution
+# ---------------------------------------------------------------------------
+
+# In a 15-year library EXIF dates are often faked (Android screenshots),
+# stripped (WhatsApp/Telegram → unreliable mtime) or mtime is reset by a
+# FAT32/exFAT copy. We never trust a single signal blindly: we cross-check
+# the EXIF DateTimeOriginal against the date the capturing app embedded in
+# the FILENAME, and tag every resolved date with a confidence + source so
+# suspicious ones can be surfaced before a file is mis-filed into the wrong year.
+
+MIN_PLAUSIBLE_YEAR = 1990
+# Bit-rot / FAT-epoch sentinels cameras and bad clocks emit; never a real capture.
+_FAKE_SENTINEL_DATES = {date(1980, 1, 1), date(2000, 1, 1)}
+# EXIF and filename within this many days → corroborated (HIGH).
+_AGREE_DAYS = 1
+# EXIF and filename more than this many days apart → contradiction (filename wins, LOW).
+_CONTRADICT_DAYS = 2
+
+# Filename timestamp patterns, tried in order; each captures named groups
+# y/mon/day (always) and optional h/min/sec. Anchored at the start of the
+# stem so a stray digit run mid-name can't masquerade as a date.
+_FILENAME_PATTERNS = [
+    # Google Pixel: PXL_20211103_080910123  (trailing milliseconds dropped)
+    re.compile(
+        r"^PXL_(?P<y>\d{4})(?P<mon>\d{2})(?P<day>\d{2})_"
+        r"(?P<h>\d{2})(?P<min>\d{2})(?P<sec>\d{2})\d*", re.IGNORECASE),
+    # IMG_/VID_/MVIMG_ with time: IMG_20230615_143022
+    re.compile(
+        r"^(?:IMG|VID|MVIMG|MVI)[_-](?P<y>\d{4})(?P<mon>\d{2})(?P<day>\d{2})"
+        r"[_-](?P<h>\d{2})(?P<min>\d{2})(?P<sec>\d{2})", re.IGNORECASE),
+    # Android screenshot with time: Screenshot_20230615-143022
+    #   or Screenshot_2023-06-15-14-30-22  (dashes optional throughout)
+    re.compile(
+        r"^Screenshot[_-](?P<y>\d{4})-?(?P<mon>\d{2})-?(?P<day>\d{2})"
+        r"[-_](?P<h>\d{2})-?(?P<min>\d{2})-?(?P<sec>\d{2})", re.IGNORECASE),
+    # WhatsApp: IMG-20230615-WA0001  (no time component)
+    re.compile(
+        r"^(?:IMG|VID)-(?P<y>\d{4})(?P<mon>\d{2})(?P<day>\d{2})-WA\d+",
+        re.IGNORECASE),
+    # Signal: Signal-2023-06-15-143022  or  Signal-2023-06-15
+    re.compile(
+        r"^Signal[-_](?P<y>\d{4})-(?P<mon>\d{2})-(?P<day>\d{2})"
+        r"(?:[-_T](?P<h>\d{2})(?P<min>\d{2})(?P<sec>\d{2}))?", re.IGNORECASE),
+    # IMG_/VID_ date only: IMG_20230615  (no time, not followed by more digits)
+    re.compile(
+        r"^(?:IMG|VID|MVIMG|MVI)[_-](?P<y>\d{4})(?P<mon>\d{2})(?P<day>\d{2})(?!\d)",
+        re.IGNORECASE),
+    # Screenshot date only: Screenshot_2023-06-15 / Screenshot_20230615
+    re.compile(
+        r"^Screenshot[_-](?P<y>\d{4})-?(?P<mon>\d{2})-?(?P<day>\d{2})(?!\d)",
+        re.IGNORECASE),
+    # Bare leading date + sequence: 20230615_123456 / 20230615-001
+    re.compile(
+        r"^(?P<y>\d{4})(?P<mon>\d{2})(?P<day>\d{2})[_-]\d{3,}", re.IGNORECASE),
+]
+
+
+def _parse_filename_dt(filename: str | None) -> datetime | None:
+    """
+    Extract a capture timestamp embedded in a filename (e.g. IMG_20230615_143022,
+    PXL_…, Screenshot_…, IMG-…-WA####, Signal-…). Returns a naive datetime when
+    the digits form a valid calendar date (midnight when no time is present),
+    else None. Conservative: an out-of-range month/day yields None, not a guess.
+
+    Rationale: messaging apps strip EXIF, but the capturing app named the file at
+    capture time — so the filename date is often MORE reliable than residual EXIF.
+    """
+    if not filename:
+        return None
+    stem = Path(filename).stem or filename
+    for pat in _FILENAME_PATTERNS:
+        m = pat.match(stem)
+        if not m:
+            continue
+        g = m.groupdict()
+        try:
+            return datetime(
+                int(g["y"]), int(g["mon"]), int(g["day"]),
+                int(g.get("h") or 0), int(g.get("min") or 0), int(g.get("sec") or 0),
+            )
+        except (TypeError, ValueError):
+            continue  # invalid calendar date/time → try the next pattern
+    return None
+
+
+def _is_sane_date(dt: datetime | None, today: date) -> bool:
+    """A date we can trust as real: not None, not in the future, not absurdly
+    old, and not a known fake sentinel (FAT epoch / bad-clock default)."""
+    if dt is None:
+        return False
+    if dt.year < MIN_PLAUSIBLE_YEAR:
+        return False
+    if dt.date() > today:
+        return False
+    if dt.date() in _FAKE_SENTINEL_DATES:
+        return False
+    return True
+
+
+def _resolve_date(
+    row: Any, today: date | None = None
+) -> tuple[datetime | None, str, str | None]:
+    """
+    Resolve a file's date with a confidence rating and the signal it came from.
+
+    Returns (datetime_or_None, source, confidence) where
+        source     ∈ {exif_original, filename, exif_digitized, mtime, none}
+        confidence ∈ {HIGH, MEDIUM, LOW}  (None when source == 'none')
+
+    Resolution ladder (first applicable wins):
+      1. camera_model present AND DateTimeOriginal sane → exif_original, HIGH
+         (real cameras don't fake DateTimeOriginal)
+      2. DateTimeOriginal and filename-date agree within ~1 day → exif_original, HIGH
+      3. filename-date sane and contradicts DateTimeOriginal by > ~2 days
+         → filename, LOW   (EXIF was faked/injected; the capture app's name wins)
+      4. DateTimeOriginal sane (no corroboration, no camera) → exif_original, MEDIUM
+      5. datetime_digitized sane → exif_digitized, MEDIUM
+      6. mtime present → mtime, LOW   (last resort; may be a copy date)
+      7. otherwise → None, none
+
+    `today` is injectable so future-date detection is deterministic in tests.
+    """
+    if today is None:
+        today = datetime.now().date()
+
+    exif = _parse_exif_dt(row["datetime_original"])
+    fname = _parse_filename_dt(row["filename"])
+    digit = _parse_exif_dt(row["datetime_digitized"])
+    mt = _parse_mtime(row["mtime"])
+    has_camera = bool(row["camera_model"])
+
+    exif_sane = _is_sane_date(exif, today)
+    fname_sane = _is_sane_date(fname, today)
+
+    # 1. Trusted camera with a sane capture time.
+    if has_camera and exif_sane:
+        return exif, "exif_original", "HIGH"
+
+    # 2 & 3. Cross-check EXIF against the filename date when both are present.
+    if exif_sane and fname_sane:
+        day_gap = abs((exif.date() - fname.date()).days)
+        if day_gap <= _AGREE_DAYS:
+            return exif, "exif_original", "HIGH"
+        if day_gap > _CONTRADICT_DAYS:
+            return fname, "filename", "LOW"
+        # 1 < gap <= 2 days: ambiguous → fall through to MEDIUM EXIF.
+
+    # 3b. EXIF absent/insane but a sane filename date exists → use it (LOW).
+    if not exif_sane and fname_sane:
+        return fname, "filename", "LOW"
+
+    # 4. Lone sane EXIF, no corroboration, no camera.
+    if exif_sane:
+        return exif, "exif_original", "MEDIUM"
+
+    # 5. DateTimeDigitized as a secondary EXIF date.
+    if _is_sane_date(digit, today):
+        return digit, "exif_digitized", "MEDIUM"
+
+    # 6. Filesystem mtime — always low confidence (a copy may have reset it).
+    if mt is not None:
+        return mt, "mtime", "LOW"
+
+    # 7. No usable date at all.
+    return None, "none", None
+
+
 def _effective_date(row: Any) -> tuple[datetime | None, bool]:
     """
-    Resolve a file's date: EXIF datetime first, else filesystem mtime.
-    Returns (datetime_or_None, used_mtime).
+    Backward-compatible shim over _resolve_date for callers that only need
+    (date, used_mtime). Retained so existing path-building / counting code is
+    unchanged while date resolution now goes through the forensics ladder.
     """
-    dt = _parse_exif_dt(row["datetime_original"])
-    if dt is not None:
-        return dt, False
-    return _parse_mtime(row["mtime"]), True
+    dt, source, _ = _resolve_date(row)
+    return dt, source == "mtime"
 
 
 def _sanitize_camera(model: str | None) -> str:
@@ -339,6 +506,89 @@ def _build_target_path(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _candidate_str(row: Any) -> str:
+    """Render the competing date signals for a file as a compact one-liner,
+    e.g. 'EXIF=2023-06-15 filename=2015-04-02 mtime=2024-01-02'. Only signals
+    that parse to a date are shown."""
+    parts: list[str] = []
+    pairs = [
+        ("EXIF", _parse_exif_dt(row["datetime_original"])),
+        ("filename", _parse_filename_dt(row["filename"])),
+        ("digitized", _parse_exif_dt(row["datetime_digitized"])),
+        ("mtime", _parse_mtime(row["mtime"])),
+    ]
+    for name, dt in pairs:
+        if dt is not None:
+            parts.append(f"{name}={dt.date().isoformat()}")
+    return " ".join(parts) if parts else "no candidates"
+
+
+_DATE_AUDIT_FILE_TYPES = ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC", "VIDEO")
+
+
+def audit_dates(db: Database, today: date | None = None) -> dict[str, int]:
+    """
+    DB-only date forensics pass (no disk read, no ExifTool — like `reclassify`).
+
+    For every dated file type, resolve a date via the confidence ladder, persist
+    `date_source` / `date_confidence` on the row, and log every LOW-confidence
+    date to run_log (phase='review', prefix 'Suspicious-date') so the user can
+    review mis-dated files BEFORE they are filed into the wrong year by `plan`.
+
+    Idempotent: clears its own prior run_log entries first, so re-running never
+    duplicates them. Returns a summary count dict.
+    """
+    # Idempotency: drop prior suspicious-date entries before re-logging.
+    db.conn.execute(
+        "DELETE FROM run_log WHERE phase='review' AND message LIKE 'Suspicious-date%'"
+    )
+    db.commit()
+
+    counts = {"total": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "none": 0}
+    low = 0
+    commit_buf = 0
+
+    for batch in db.iter_files():
+        for row in batch:
+            if row["status"] == "error" or row["file_type"] not in _DATE_AUDIT_FILE_TYPES:
+                continue
+            dt, source, conf = _resolve_date(row, today=today)
+            counts["total"] += 1
+            counts[conf if conf else "none"] += 1
+
+            db.update_file(row["file_id"], date_source=source, date_confidence=conf)
+            commit_buf += 1
+
+            # Surface LOW-confidence dates that still resolved to *a* date — a
+            # None date is plain NoDate, not a mis-dating risk.
+            if conf == "LOW" and dt is not None:
+                low += 1
+                db.log(
+                    "WARN",
+                    f"Suspicious-date [LOW] {row['path']}: "
+                    f"{_candidate_str(row)} → chose {source} ({dt.date().isoformat()})",
+                    phase="review", path=row["path"], file_id=row["file_id"],
+                )
+
+            if commit_buf >= 1000:
+                db.commit()
+                commit_buf = 0
+
+    if low:
+        db.log(
+            "WARN",
+            f"Suspicious-date summary: {low} file(s) have a LOW-confidence date "
+            "(faked/stripped EXIF or copy-reset mtime). Review before execute:\n"
+            "  SELECT path, message FROM run_log "
+            "WHERE phase='review' AND message LIKE 'Suspicious-date%';",
+            phase="review",
+        )
+    db.commit()
+
+    return {"total": counts["total"], "low": low,
+            "high": counts["HIGH"], "medium": counts["MEDIUM"]}
+
+
 def plan(db: Database, target_root: Path, force: bool = False) -> None:
     """
     Phase 4: build the operations table and prompt the user to confirm.
@@ -362,6 +612,12 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
         db.commit()
 
     db.set_phase_status("review", "running")
+
+    # ── 0. Date forensics: rate every file's date + flag suspicious ones ──────
+    # Populates date_source / date_confidence and logs LOW-confidence dates to
+    # run_log so faked/stripped-EXIF files are surfaced before they are filed.
+    with console.status("Auditing file dates (confidence + source)…"):
+        date_audit = audit_dates(db)
 
     # ── 1. Identify files to stage-delete ────────────────────────────────────
     stage_ids: set[int] = set()
@@ -634,6 +890,15 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
             "  Full list recorded in run_log — review later with:\n"
             "    [cyan]SELECT path, message FROM run_log "
             "WHERE phase='review' AND message LIKE 'No-event%';[/cyan]\n"
+        )
+
+    if date_audit["low"]:
+        console.print(
+            f"  [yellow]⚠[/yellow]  {date_audit['low']:,} file(s) have a "
+            "[bold]LOW-confidence date[/bold] (faked/stripped EXIF or copy-reset mtime)\n"
+            "     — they may be filed into the wrong year. Review before execute with:\n"
+            "    [cyan]SELECT path, message FROM run_log "
+            "WHERE phase='review' AND message LIKE 'Suspicious-date%';[/cyan]\n"
         )
 
     if near_pairs:
