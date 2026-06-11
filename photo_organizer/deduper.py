@@ -198,20 +198,22 @@ def dedup_near(
 
     db.set_phase_status("dedup_near", "running")
 
-    # Only hash CAMERA_JPEGs that don't have a phash yet.
-    # NOTE: VIDEO files are intentionally excluded from perceptual hashing
-    # (pHash is image-only). Videos still get exact SHA-256 dedup in Pass A.
+    # Hash CAMERA_JPEG, DEV_JPEG, and HEIC files — all three are image types
+    # whose visual content can be meaningfully compared with pHash.
+    # NOTE: VIDEO files are intentionally excluded (pHash is image-only;
+    # videos still get exact SHA-256 dedup in Pass A).
+    _PHASH_TYPES = ["CAMERA_JPEG", "DEV_JPEG", "HEIC"]
     to_hash: list = []
-    for batch in db.iter_files(file_type="CAMERA_JPEG"):
+    for batch in db.iter_files(file_types=_PHASH_TYPES):
         for row in batch:
             if row["phash"] is None:
                 to_hash.append(row)
 
     total = len(to_hash)
-    console.print(f"  CAMERA_JPEG files to perceptual-hash: {total:,}")
+    console.print(f"  Image files to perceptual-hash (CAMERA_JPEG/DEV_JPEG/HEIC): {total:,}")
 
     if total == 0:
-        print_success("All JPEG files already perceptual-hashed.")
+        print_success("All image files already perceptual-hashed.")
         db.set_phase_status("dedup_near", "complete", {"phashed": 0})
         return
 
@@ -221,7 +223,7 @@ def dedup_near(
     phash_index: dict[str, list[int]] = {}
 
     # Pre-load existing phashes
-    for batch in db.iter_files(file_type="CAMERA_JPEG"):
+    for batch in db.iter_files(file_types=_PHASH_TYPES):
         for row in batch:
             if row["phash"] is not None:
                 phash_index.setdefault(row["phash"], []).append(row["file_id"])

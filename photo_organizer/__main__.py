@@ -205,7 +205,8 @@ def cmd_plan(args):
 
     from .planner import plan
     with Database(db_path) as db:
-        plan(db, target_root=target, force=getattr(args, "force", False))
+        plan(db, target_root=target, force=getattr(args, "force", False),
+             assume_yes=getattr(args, "yes", False))
 
 
 def cmd_execute(args):
@@ -421,6 +422,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dates-only", action="store_true",
         help="Run only the date-forensics audit (DB only, no disk read): rate every "
              "file's date confidence/source and log suspicious dates — no plan, no target.",
+    )
+    p_plan.add_argument(
+        "--yes", action="store_true",
+        help="Skip the interactive confirmation prompt and auto-confirm the plan.",
     )
     p_plan.set_defaults(func=cmd_plan)
 
