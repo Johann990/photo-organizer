@@ -144,8 +144,12 @@ def _attempt(src: Path, dst: Path, tmp: Path, expected_sha: str | None) -> bool:
     to verify against — we trust the byte-copy and report success.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    _copy_bytes(src, tmp)
-    os.replace(tmp, dst)  # atomic on the same filesystem
+    try:
+        _copy_bytes(src, tmp)
+        os.replace(tmp, dst)  # atomic on the same filesystem
+    except OSError:
+        _cleanup_tmp(tmp)
+        raise
     if expected_sha is None:
         return True
     return _sha256_file(dst) == expected_sha
@@ -245,8 +249,12 @@ def _clone_db(db: Database, dest_root: Path, expected_rel: set[str]) -> None:
         expected_rel.add(rel.as_posix())
     dst_db.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_for(dst_db)
-    shutil.copy2(db.path, tmp)
-    os.replace(tmp, dst_db)
+    try:
+        shutil.copy2(db.path, tmp)
+        os.replace(tmp, dst_db)
+    except OSError:
+        _cleanup_tmp(tmp)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +398,12 @@ def clone(
             prog.advance(1, current_path=str(src))
 
     # Self-describing replica: copy the ledger into the destination.
-    _clone_db(db, dest_root, expected_rel)
+    try:
+        _clone_db(db, dest_root, expected_rel)
+    except OSError as exc:
+        stats.errors += 1
+        stats.error_paths.append(str(db.path))
+        db.log("ERROR", f"Failed to copy ledger DB to destination: {exc}", phase="clone")
 
     if prune:
         _prune(db, dest_root, expected_rel, stats)

@@ -462,7 +462,24 @@ class Database:
                 break
             yield batch
 
+    _UPDATABLE_FILE_COLS: frozenset[str] = frozenset({
+        "path", "filename", "extension", "size_bytes", "mtime",
+        "file_type", "datetime_original", "datetime_digitized",
+        "camera_make", "camera_model", "width", "height",
+        "gps_lat", "gps_lon", "gps_alt", "lens_model",
+        "iso", "aperture", "shutter_speed", "focal_length", "software",
+        "sha256", "phash",
+        "rating", "keywords", "description", "label",
+        "duration_seconds", "video_codec", "frame_rate",
+        "raw_pair_id", "jpeg_pair_id",
+        "status", "error_msg", "scanned_at", "updated_at",
+        "date_source", "date_confidence",
+    })
+
     def update_file(self, file_id: int, **kwargs):
+        unknown = set(kwargs) - self._UPDATABLE_FILE_COLS
+        if unknown:
+            raise ValueError(f"update_file: unknown column(s): {sorted(unknown)}")
         kwargs["updated_at"] = _now()
         set_clause = ", ".join(f"{k} = :{k}" for k in kwargs)
         kwargs["file_id"] = file_id
