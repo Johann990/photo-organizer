@@ -145,7 +145,24 @@ CREATE TABLE IF NOT EXISTS known_cameras (
     owner     TEXT DEFAULT 'self',
     UNIQUE(make, model)
 );
+
+-- Tiny key/value table for durable database-wide metadata. The 'schema_version'
+-- row lets a newer build refuse to operate on a database written by an even
+-- newer (unknown) build, and lets older databases be recognised and migrated.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
+# SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
+# guard, not the migration mechanism: migrations stay idempotent ALTERs.
+SCHEMA_VERSION = 2
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when a database was written by a newer, unsupported schema."""
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +194,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         ("duration_seconds", "REAL"),     # video length in seconds
         ("video_codec",      "TEXT"),     # video codec id
         ("frame_rate",       "REAL"),     # video frames per second
+        ("date_confidence",  "TEXT"),     # HIGH / MEDIUM / LOW (date forensics)
+        ("date_source",      "TEXT"),     # exif_original / filename / exif_digitized / mtime / none
     ]
     for col_name, col_type in new_cols:
         if col_name not in existing:
@@ -240,6 +259,58 @@ def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _check_schema_version(conn: sqlite3.Connection) -> None:
+    """
+    Read (or initialise) the durable schema_version marker and guard against
+    opening a database written by a NEWER, unknown build.
+
+    - Fresh / pre-marker DB → stamp the current SCHEMA_VERSION (migrations have
+      already run idempotently by the time we get here).
+    - stored < SCHEMA_VERSION → an older DB that the just-run migrations have
+      upgraded; bump the marker.
+    - stored > SCHEMA_VERSION → written by a newer build we don't understand →
+      refuse, so we never corrupt a library we can't fully interpret.
+    """
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+        return
+
+    try:
+        stored = int(row[0])
+    except (TypeError, ValueError):
+        stored = 0  # corrupt marker → treat as ancient, let migrations own it
+
+    if stored > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"Database schema version {stored} is newer than this build supports "
+            f"(max {SCHEMA_VERSION}). Upgrade photo-organizer, or open the library "
+            "with the version that wrote it. Refusing to proceed to avoid data loss."
+        )
+    if stored < SCHEMA_VERSION:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+
+
+def default_db_path(target_root: str | Path) -> Path:
+    """
+    Where the durable library database lives when the user did not pass --db.
+
+    The DB is the durable record of every organising decision, so it belongs
+    WITH the library it describes: `{target}/.photo_organizer/library.db`.
+    Back up that folder = back up your organising decisions.
+    """
+    return Path(target_root) / ".photo_organizer" / "library.db"
+
+
 def _chunks(lst: list, size: int) -> Iterator[list]:
     for i in range(0, len(lst), size):
         yield lst[i : i + size]
@@ -259,6 +330,10 @@ class Database:
     # ---- connection --------------------------------------------------------
 
     def connect(self) -> "Database":
+        # Create the parent directory if needed (e.g. the default
+        # {target}/.photo_organizer/ home), so a fresh library DB can be created.
+        if self.path.parent and not self.path.parent.exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -266,6 +341,7 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
         _apply_migrations(self._conn)
+        _check_schema_version(self._conn)
         return self
 
     def close(self):

@@ -37,6 +37,9 @@ env/
 .DS_Store
 ._*
 
+# ── Compound Engineering local config (machine-specific preferences)
+.compound-engineering/*.local.yaml
+
 # ── Windows
 Thumbs.db
 desktop.ini

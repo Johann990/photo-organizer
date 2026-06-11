@@ -13,6 +13,7 @@ Only runs after explicit confirmation from Phase 4 (plan).
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,12 +30,87 @@ from .progress import (
     print_warning,
     print_error,
 )
+from .validator import _same_drive
 
 DB_COMMIT_EVERY = 200
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight gate — fail fast before grinding partway through the move loop
+# ---------------------------------------------------------------------------
+
+def _resolve_target_root(db: Database, ops: list) -> Path | None:
+    """
+    Best-effort recovery of the target root chosen at plan time.
+
+    Prefer the value recorded in the 'review' phase summary; fall back to the
+    common ancestor of the confirmed operations' target paths.
+    """
+    row = db.conn.execute(
+        "SELECT summary_json FROM phases WHERE phase_name = 'review'"
+    ).fetchone()
+    if row and row["summary_json"]:
+        try:
+            data = json.loads(row["summary_json"])
+            if data.get("target_root"):
+                return Path(data["target_root"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    targets = [op["target_path"] for op in ops if op["target_path"]]
+    if not targets:
+        return None
+    try:
+        return Path(os.path.commonpath(targets))
+    except ValueError:
+        return None
+
+
+def _preflight(db: Database, ops: list) -> str | None:
+    """
+    Cheap one-time guard run before the move loop. Returns an error message to
+    refuse on, or None when clear to proceed.
+
+    Checks (lightweight — NOT a re-run of the full `validate` sample scan):
+      1. DB file is writable
+      2. the target's _staging/to_delete/ path can be created
+      3. target shares a volume with every distinct source drive
+         (os.rename() cannot cross volumes — reuses validator._same_drive)
+    """
+    # 1. DB writable
+    if not os.access(db.path, os.W_OK):
+        return f"Database is not writable: {db.path}"
+
+    target_root = _resolve_target_root(db, ops)
+    if target_root is None:
+        return None  # nothing to check against — let the move loop proceed
+
+    # 2. staging path creatable (also proves the target volume is writable)
+    staging = target_root / "_staging" / "to_delete"
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"Cannot create staging directory {staging}: {exc}"
+
+    # 3. same-volume check. Dedupe sources by drive anchor so this stays O(drives),
+    # not O(files); _same_drive() uses st_dev so it catches true volume mismatches.
+    reps: dict[str, Path] = {}
+    for op in ops:
+        parent = Path(op["source_path"]).parent
+        reps.setdefault(parent.anchor, parent)
+    for src in reps.values():
+        if src.exists() and not _same_drive(src, staging):
+            return (
+                f"Target {target_root} is on a different volume than source {src}.\n"
+                "  os.rename() cannot cross drives — choose a --target on the same "
+                "drive as your photos (e.g. both on E:\\), or re-run `plan` with one.\n"
+                "  Power users can bypass this guard with --skip-preflight."
+            )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +125,7 @@ def execute(
     camera: str | None = None,
     software: str | None = None,
     file_type: str | None = None,
+    skip_preflight: bool = False,
 ) -> None:
     """
     Phase 5: Execute confirmed operations.
@@ -59,6 +136,8 @@ def execute(
       camera    — substring match on camera_model, e.g. "ILCE-7RM2"
       software  — substring match on software, e.g. "Lightroom"
       file_type — exact file_type, e.g. "RAW" / "CAMERA_JPEG" / "DEV_JPEG" / "VIDEO"
+
+    skip_preflight — bypass the same-volume / writability gate (power users).
     """
     print_phase_header("5/5", "Executing Operations")
 
@@ -116,6 +195,18 @@ def execute(
 
     total = len(ops)
     console.print(f"  Confirmed operations: {total:,}\n")
+
+    # ── Pre-flight gate ───────────────────────────────────────────────────────
+    # Catch a wrong-drive target ONCE, up front, instead of letting every file
+    # fail mid-run with a cross-device rename error (EXDEV / WinError 17).
+    if not skip_preflight:
+        problem = _preflight(db, ops)
+        if problem is not None:
+            print_error(f"Pre-flight check failed — refusing to start.\n  {problem}")
+            db.log("ERROR", f"Pre-flight refused execute: {problem}", phase="execute")
+            db.commit()
+            return
+        print_success("Pre-flight OK — target on same volume, DB writable, staging reachable.")
 
     # Count before for verification
     files_before: int = db.conn.execute(

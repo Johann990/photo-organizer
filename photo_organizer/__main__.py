@@ -22,7 +22,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .db import Database
+from .db import Database, SchemaVersionError, default_db_path
 from .progress import console, print_error
 
 
@@ -43,14 +43,41 @@ def _load_cfg(args):
         sys.exit(1)
 
 
+def _resolve_db_path(db_arg, cfg_db, target) -> Path | None:
+    """
+    Pure resolution of where the database lives (no I/O, no exit) so it can be
+    unit-tested. Priority:
+      1. explicit --db                          (always wins)
+      2. db set in the config file
+      3. default home beside the library        {target}/.photo_organizer/library.db
+      4. None                                   (caller errors out)
+
+    The default in (3) makes the DB a durable, library-adjacent asset: when a
+    --target exists the organising decisions live with the photos they describe.
+    """
+    if db_arg:
+        return Path(db_arg)
+    if cfg_db:
+        return Path(cfg_db)
+    if target is not None:
+        return default_db_path(target)
+    return None
+
+
 def _db_path(args, cfg) -> Path:
-    """Resolve DB path: CLI flag wins, then config, then error."""
-    if getattr(args, "db", None):
-        return Path(args.db)
-    if cfg and cfg.db:
-        return cfg.db
-    print_error("No database path provided. Use --db or --config.")
-    sys.exit(1)
+    """Resolve DB path: CLI flag wins, then config, then library default."""
+    resolved = _resolve_db_path(
+        getattr(args, "db", None),
+        cfg.db if cfg else None,
+        _target_path(args, cfg),
+    )
+    if resolved is None:
+        print_error(
+            "No database path provided. Use --db, --config, or pass --target "
+            "(the DB then defaults to {target}/.photo_organizer/library.db)."
+        )
+        sys.exit(1)
+    return resolved
 
 
 def _target_path(args, cfg) -> Path | None:
@@ -150,6 +177,22 @@ def cmd_dedup(args):
 def cmd_plan(args):
     cfg = _load_cfg(args)
     db_path = _db_path(args, cfg)
+
+    # Date forensics audit only — DB-only, no plan/prompt, no target needed.
+    if getattr(args, "dates_only", False):
+        from .planner import audit_dates
+        with Database(db_path) as db:
+            summary = audit_dates(db)
+        console.print(
+            f"  Audited [bold]{summary['total']:,}[/bold] files — "
+            f"[green]{summary['high']:,} HIGH[/green], "
+            f"[yellow]{summary['medium']:,} MEDIUM[/yellow], "
+            f"[red]{summary['low']:,} LOW[/red] (suspicious).\n"
+            "  Review LOW dates: [cyan]SELECT path, message FROM run_log "
+            "WHERE phase='review' AND message LIKE 'Suspicious-date%';[/cyan]"
+        )
+        return
+
     target = _target_path(args, cfg)
 
     if target is None:
@@ -176,7 +219,81 @@ def cmd_execute(args):
             camera=getattr(args, "camera", None),
             software=getattr(args, "software", None),
             file_type=getattr(args, "type", None),
+            skip_preflight=getattr(args, "skip_preflight", False),
         )
+
+
+def cmd_add(args):
+    cfg = _load_cfg(args)
+    db_path = _db_path(args, cfg)
+    target = _target_path(args, cfg)
+    if target is None:
+        print_error(
+            "No target directory provided.\n"
+            "  Use: add SOURCE --target PATH --db DB  or  add SOURCE --config config.json"
+        )
+        sys.exit(1)
+
+    # Sources: positional path(s) win; else config input_dirs.
+    src_args = getattr(args, "sources", None)
+    if src_args:
+        sources = [Path(s) for s in src_args]
+    elif cfg and cfg.input_dirs:
+        sources = cfg.input_dirs
+    else:
+        print_error(
+            "No source directory provided.\n"
+            "  Use: add SOURCE_PATH --target PATH --db DB"
+        )
+        sys.exit(1)
+
+    workers = _workers(args, cfg)
+    secondary = getattr(args, "secondary", False) or (cfg.use_secondary_signals if cfg else False)
+    hamming = getattr(args, "hamming", None) or (cfg.hamming_threshold if cfg else 8)
+
+    from .adder import add
+    with Database(db_path) as db:
+        if cfg and cfg.known_cameras:
+            for cam in cfg.known_cameras:
+                db.add_known_camera(cam.get("make"), cam["model"])
+        add(
+            db, sources, target,
+            workers=workers,
+            hamming_threshold=hamming,
+            use_secondary_signals=secondary,
+            assume_yes=getattr(args, "yes", False),
+            do_execute=not getattr(args, "no_execute", False),
+        )
+
+
+def cmd_reconcile(args):
+    cfg = _load_cfg(args)
+    from .reconcile import reconcile
+    with Database(_db_path(args, cfg)) as db:
+        ok = reconcile(db, verify_disk=getattr(args, "verify_disk", False))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_clone(args):
+    cfg = _load_cfg(args)
+    dest = getattr(args, "dest", None)
+    if not dest:
+        print_error(
+            "No destination provided.\n"
+            "  Use: clone DEST_ROOT --target LIB_ROOT --db DB"
+        )
+        sys.exit(1)
+    from .cloner import clone
+    with Database(_db_path(args, cfg)) as db:
+        stats = clone(
+            db,
+            dest,
+            target_root=_target_path(args, cfg),
+            verify_all=getattr(args, "verify_all", False),
+            prune=getattr(args, "prune", False),
+        )
+    # Non-zero exit when the backup is not provably complete + intact.
+    sys.exit(0 if (stats.errors == 0 and stats.missing_source == 0) else 1)
 
 
 def cmd_undo(args):
@@ -192,6 +309,10 @@ def cmd_review(args):
         if getattr(args, "auto", False):
             from .reviewer import auto_resolve_near_dupes
             auto_resolve_near_dupes(db, commit=getattr(args, "commit", False))
+        elif getattr(args, "web", False):
+            from .webreview import serve
+            serve(db, review_all=getattr(args, "all", False),
+                  port=getattr(args, "port", 0))
         else:
             from .reviewer import review_near_dupes
             review_near_dupes(db, review_all=getattr(args, "all", False))
@@ -296,7 +417,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--target", metavar="PATH",
         help="Root directory for reorganised library (overrides config; same drive as photos)",
     )
+    p_plan.add_argument(
+        "--dates-only", action="store_true",
+        help="Run only the date-forensics audit (DB only, no disk read): rate every "
+             "file's date confidence/source and log suspicious dates — no plan, no target.",
+    )
     p_plan.set_defaults(func=cmd_plan)
+
+    # add — incremental: place ONLY new sources into an already-organized library
+    p_add = sub.add_parser(
+        "add", parents=[shared],
+        help="Incrementally add NEW source(s) to an already-organized library "
+             "(deduped against the whole library; never reshuffles organized files)",
+    )
+    p_add.add_argument(
+        "sources", metavar="SOURCE_PATH", nargs="*",
+        help="New source director(ies) to add (omit when using --config input_dirs)",
+    )
+    p_add.add_argument(
+        "--target", metavar="PATH",
+        help="Root of the existing organized library (same drive as the new source)",
+    )
+    p_add.add_argument("--workers", type=int, help="Parallel ExifTool/hash threads")
+    p_add.add_argument(
+        "--hamming", type=int,
+        help="Hamming distance threshold for near-dupes vs the library (default: 8)",
+    )
+    p_add.add_argument(
+        "--secondary", action="store_true",
+        help="Enable secondary resized-JPEG signals (match the scan-time setting)",
+    )
+    p_add.add_argument(
+        "--yes", action="store_true",
+        help="Skip the confirmation prompt (non-interactive)",
+    )
+    p_add.add_argument(
+        "--no-execute", action="store_true",
+        help="Build and confirm the plan but do NOT move files (run execute later)",
+    )
+    p_add.set_defaults(func=cmd_add)
 
     # execute
     p_exec = sub.add_parser(
@@ -310,7 +469,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--type", metavar="FILE_TYPE",
         help="Only move this file_type (RAW / CAMERA_JPEG / DEV_JPEG / RESIZED_JPEG / VIDEO)",
     )
+    p_exec.add_argument(
+        "--skip-preflight", action="store_true",
+        help="Bypass the up-front same-volume / writability gate (power users)",
+    )
     p_exec.set_defaults(func=cmd_execute)
+
+    # reconcile
+    p_recon = sub.add_parser(
+        "reconcile", parents=[shared],
+        help="Conservation proof: prove every scanned file is in exactly one "
+             "terminal state (balance sheet; UNACCOUNTED must be 0)",
+    )
+    p_recon.add_argument(
+        "--verify-disk", action="store_true",
+        help="Also confirm each moved/staged file still exists on disk "
+             "(I/O; flags any 'done' file missing from its claimed location)",
+    )
+    p_recon.set_defaults(func=cmd_reconcile)
+
+    # clone — non-destructive incremental backup to another volume
+    p_clone = sub.add_parser(
+        "clone", parents=[shared],
+        help="Replicate the organized library to another drive/NAS: incremental, "
+             "verified against the DB's known-good hashes, never deletes the source",
+    )
+    p_clone.add_argument(
+        "dest", metavar="DEST_ROOT",
+        help="Destination root on another volume (e.g. E:\\Backup or a NAS path)",
+    )
+    p_clone.add_argument(
+        "--target", metavar="PATH",
+        help="Organized library root to replicate (overrides config); "
+             "defaults to the common ancestor of organized files",
+    )
+    p_clone.add_argument(
+        "--verify-all", action="store_true",
+        help="Paranoid: re-hash EVERY destination file against the DB (slow), "
+             "not just newly-copied ones",
+    )
+    p_clone.add_argument(
+        "--prune", action="store_true",
+        help="Remove destination files no longer in the library (OFF by default; "
+             "warns and lists before removing)",
+    )
+    p_clone.set_defaults(func=cmd_clone)
 
     # undo
     p_undo = sub.add_parser(
@@ -357,6 +560,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Manual review: also walk distinct look-alike (burst) clusters "
              "(default skips them — they are kept)",
     )
+    p_review.add_argument(
+        "--web", action="store_true",
+        help="Serve a local HTML contact-sheet (thumbnails + smart defaults) "
+             "instead of the terminal review; decisions save live to the DB",
+    )
+    p_review.add_argument(
+        "--port", type=int, default=0,
+        help="With --web: TCP port to bind on 127.0.0.1 (default: ephemeral)",
+    )
     p_review.set_defaults(func=cmd_review)
 
     return parser
@@ -371,6 +583,9 @@ def main():
     args = parser.parse_args()
     try:
         args.func(args)
+    except SchemaVersionError as e:
+        print_error(str(e))
+        sys.exit(1)
     except FileNotFoundError as e:
         print_error(str(e))
         sys.exit(1)
