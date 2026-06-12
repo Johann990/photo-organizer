@@ -279,3 +279,7 @@ python -m photo_organizer undo --db C:\photos.db
 - **HEIC 近似去重需 `pillow-heif`**：iPhone `.heic`/`.heif` 的感知雜湊（pHash）需要 `pip install pillow-heif`，否則這些檔案在 `dedup` 的近似比對會逐張失敗（記成 pHash error，不會中斷整體流程）。掃描／搬移不受影響（日期與分類走 ExifTool）。/ HEIC perceptual hashing needs `pillow-heif`; without it, HEIC files fail per-file in `dedup` near-match (logged, non-fatal). Scan/move are unaffected (date & classify use ExifTool).
 - **知識庫 / Knowledge store**：`docs/solutions/` — 已記錄的 bugs、最佳實踐與架構決策（含 YAML frontmatter：`module`、`tags`、`problem_type`），實作或除錯時可參考。/ documented solutions organized by category with YAML frontmatter — relevant when implementing or debugging in documented areas.
 - **領域詞彙 / Domain vocabulary**：`CONCEPTS.md` — 專案特有術語的精確定義，新進工程師入門或閱讀 docs/solutions/ 時可查。/ precise definitions for project-specific terms; consult when reading docs/solutions/ or onboarding.
+
+## 已知限制 / Known Limitations
+
+- **Terminal 進度條視覺混亂（調整視窗大小時）/ Progress bar display glitch on terminal resize**: Rich 進度條根據終端寬度佈局；改變視窗大小時會出現重影/混亂。進度條會自動恢復、數據完全準確、不影響實際運行。建議跑長期進程時不改窗口大小，或接受過渡期的視覺混亂。/ Rich progress bars reflow on terminal width changes, causing visual glitches during resize. Data and performance unaffected; bars self-recover. Avoid resizing during long operations, or tolerate transient display noise.
