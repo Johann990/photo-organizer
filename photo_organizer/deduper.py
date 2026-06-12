@@ -263,13 +263,17 @@ def dedup_near(
     # high-order pHash bits differed (e.g. 0x0…0 vs 0x8…0 are Hamming-1 yet
     # sort to opposite ends). See tests/test_bktree.py for the counterexample.
     near_pairs = 0
-    with console.status("Finding near duplicate pairs (Hamming distance)…"):
-        # Distinct 16-char hex pHash → its 64-bit int value.
-        ph_by_int: dict[int, str] = {int(ph, 16): ph for ph in phash_index}
+    # Distinct 16-char hex pHash → its 64-bit int value.
+    ph_by_int: dict[int, str] = {int(ph, 16): ph for ph in phash_index}
 
-        tree = BKTree()
-        tree.add_many(ph_by_int.keys())
+    tree = BKTree()
+    tree.add_many(ph_by_int.keys())
 
+    with PhaseProgress(
+        "Finding near-duplicate pairs (Hamming distance)",
+        total=len(ph_by_int),
+        phase="3B",
+    ) as p:
         for a_int, ph_a in ph_by_int.items():
             ids_a = phash_index[ph_a]
 
@@ -291,7 +295,9 @@ def dedup_near(
                         db.insert_duplicate(id_a, id_b, "NEAR", hamming)
                         near_pairs += 1
 
-        db.commit()
+            p.advance(1)
+
+    db.commit()
 
     summary = {
         "phashed": phashed,
