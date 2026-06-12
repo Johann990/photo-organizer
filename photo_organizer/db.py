@@ -594,7 +594,7 @@ class Database:
     def insert_duplicate(self, file_id_a: int, file_id_b: int,
                          dup_type: str, hamming: int | None = None):
         # Normalise order so (a,b) and (b,a) are treated as same pair
-        a, b = sorted([file_id_a, file_id_b])
+        a, b = (file_id_a, file_id_b) if file_id_a < file_id_b else (file_id_b, file_id_a)
         self.conn.execute(
             """
             INSERT OR IGNORE INTO duplicates
@@ -602,6 +602,24 @@ class Database:
             VALUES (?, ?, ?, ?)
             """,
             (a, b, dup_type, hamming),
+        )
+
+    def insert_duplicate_batch(
+        self,
+        pairs: list[tuple[int, int, str, int | None]],
+    ) -> None:
+        """Bulk-insert near-duplicate pairs.  ~10-50× faster than per-call inserts."""
+        normalized = [
+            (a, b, t, h) if a < b else (b, a, t, h)
+            for a, b, t, h in pairs
+        ]
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO duplicates
+                (file_id_a, file_id_b, dup_type, hamming_distance)
+            VALUES (?, ?, ?, ?)
+            """,
+            normalized,
         )
 
     def count_duplicates(self, dup_type: str | None = None) -> int:

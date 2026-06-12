@@ -269,6 +269,18 @@ def dedup_near(
     tree = BKTree()
     tree.add_many(ph_by_int.keys())
 
+    _PAIR_FLUSH = 10_000   # executemany every N pairs — big batches amortise overhead
+    pair_buf: list[tuple[int, int, str, int]] = []
+
+    def _flush(buf: list) -> int:
+        if not buf:
+            return 0
+        db.insert_duplicate_batch(buf)
+        db.commit()
+        n = len(buf)
+        buf.clear()
+        return n
+
     with PhaseProgress(
         "Finding near-duplicate pairs (Hamming distance)",
         total=len(ph_by_int),
@@ -281,8 +293,7 @@ def dedup_near(
             if len(ids_a) > 1:
                 for x in range(len(ids_a)):
                     for y in range(x + 1, len(ids_a)):
-                        db.insert_duplicate(ids_a[x], ids_a[y], "NEAR", 0)
-                        near_pairs += 1
+                        pair_buf.append((ids_a[x], ids_a[y], "NEAR", 0))
 
             # All distinct hashes within the threshold — no false negatives.
             for b_int, hamming in tree.query(a_int, hamming_threshold):
@@ -292,12 +303,14 @@ def dedup_near(
                 ph_b = ph_by_int[b_int]
                 for id_a in ids_a:
                     for id_b in phash_index[ph_b]:
-                        db.insert_duplicate(id_a, id_b, "NEAR", hamming)
-                        near_pairs += 1
+                        pair_buf.append((id_a, id_b, "NEAR", hamming))
+
+            if len(pair_buf) >= _PAIR_FLUSH:
+                near_pairs += _flush(pair_buf)
 
             p.advance(1)
 
-    db.commit()
+    near_pairs += _flush(pair_buf)
 
     summary = {
         "phashed": phashed,
