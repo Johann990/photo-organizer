@@ -185,6 +185,22 @@ python -m photo_organizer unknown-cameras --db C:\photos.db
 - 列出 `camera_model` 為空的檔案分佈:依**類型 / 年份 / 廠牌 / 軟體 / 來源資料夾**
 - 純算 DB、不讀碟、不動檔案;這些檔案會進 `Others/`(除非把型號加進 known_cameras)
 
+### 執行時間統計 / Command timings（只算 DB / DB-only）
+
+每個指令跑完都會在結尾印出牆鐘耗時（`⏱ dedup finished in 12m 34s`），並**記進 DB**
+（`command_runs` 表，累積不覆蓋）。想知道哪一步最慢、上次跑多久、平均多久:
+/ every command prints its wall-clock time when it finishes and records it in the DB;
+`timings` shows the accumulated history so you know which step is slow and how long it usually takes.
+
+```bat
+python -m photo_organizer timings --db C:\photos.db
+```
+- 一張表列出每個指令的:**執行次數 / 上次 / 平均 / 最短 / 最長 / 上次執行時間**,依最近執行排序
+  / a table of runs / last / avg / min / max per command, most-recent first
+- 中斷（Ctrl-C）或出錯的執行也會記錄並標 `[interrupted]` / `[error]`,故耗時統計不會被漏記
+  / interrupted or errored runs are still recorded (tagged), so timing history has no gaps
+- `validate` 與 `timings` 本身不計入 / `validate` and `timings` itself are not recorded
+
 ### 重新分類 / Reclassify（只算 DB,不讀碟 / DB-only, no disk read）
 
 ```bat

@@ -138,6 +138,20 @@ CREATE TABLE IF NOT EXISTS run_log (
     logged_at TEXT    NOT NULL
 );
 
+-- One row per CLI command invocation — wall-clock timing history.
+-- Accumulates (never overwrites) so `timings` can show last/avg/runs and
+-- future ETA estimates can read historical throughput.
+CREATE TABLE IF NOT EXISTS command_runs (
+    run_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    command          TEXT    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'ok'
+                     CHECK(status IN ('ok','error','interrupted')),
+    started_at       TEXT    NOT NULL,
+    finished_at      TEXT    NOT NULL,
+    duration_seconds REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_command_runs_cmd ON command_runs(command);
+
 CREATE TABLE IF NOT EXISTS known_cameras (
     camera_id INTEGER PRIMARY KEY AUTOINCREMENT,
     make      TEXT,
@@ -588,6 +602,54 @@ class Database:
              status, now, status, now, phase_name),
         )
         self.conn.commit()
+
+    # ---- command timings ---------------------------------------------------
+
+    def record_command_run(
+        self,
+        command: str,
+        started_at: str,
+        finished_at: str,
+        duration_seconds: float,
+        status: str = "ok",
+    ) -> None:
+        """Append one wall-clock timing row for a CLI command invocation."""
+        self.conn.execute(
+            """
+            INSERT INTO command_runs
+                (command, status, started_at, finished_at, duration_seconds)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (command, status, started_at, finished_at, duration_seconds),
+        )
+        self.conn.commit()
+
+    def command_timings(self) -> list[dict]:
+        """Per-command timing summary: runs, last/avg/min/max seconds, last time.
+
+        Ordered by most-recently-run first.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                command,
+                COUNT(*)                AS runs,
+                AVG(duration_seconds)   AS avg_s,
+                MIN(duration_seconds)   AS min_s,
+                MAX(duration_seconds)   AS max_s,
+                MAX(finished_at)        AS last_at,
+                (SELECT duration_seconds FROM command_runs c2
+                  WHERE c2.command = c1.command
+                  ORDER BY c2.finished_at DESC LIMIT 1) AS last_s,
+                (SELECT status FROM command_runs c3
+                  WHERE c3.command = c1.command
+                  ORDER BY c3.finished_at DESC LIMIT 1) AS last_status
+            FROM command_runs c1
+            GROUP BY command
+            ORDER BY last_at DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- duplicates --------------------------------------------------------
 

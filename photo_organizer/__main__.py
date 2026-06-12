@@ -20,10 +20,52 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .db import Database, SchemaVersionError, default_db_path
 from .progress import console, print_error
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-friendly elapsed time: '4s', '2m 09s', '1h 03m 12s'."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+# Commands that never touch a database — skip timing persistence for these.
+_NO_DB_COMMANDS = {"validate", "timings"}
+
+
+def _persist_timing(args, command, started_iso, finished_iso, duration, status):
+    """Best-effort: record the command's wall-clock time in the DB.
+
+    Never raises — a timing-log failure must not fail the command itself.
+    """
+    if command in _NO_DB_COMMANDS:
+        return
+    try:
+        cfg = _load_cfg(args) if getattr(args, "config", None) else None
+        db_path = _resolve_db_path(
+            getattr(args, "db", None),
+            cfg.db if cfg else None,
+            _target_path(args, cfg),
+        )
+        if db_path is None or not Path(db_path).exists():
+            return  # no DB to write to (e.g. command failed before creating one)
+        with Database(db_path) as db:
+            db.record_command_run(
+                command, started_iso, finished_iso, duration, status
+            )
+    except Exception:
+        pass  # timing is advisory; swallow everything
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +376,46 @@ def cmd_reclassify(args):
         reclassify(db, use_secondary_signals=secondary)
 
 
+def cmd_timings(args):
+    cfg = _load_cfg(args)
+    from rich.table import Table
+
+    with Database(_db_path(args, cfg)) as db:
+        rows = db.command_timings()
+
+    if not rows:
+        console.print(
+            "  [dim]No timing history yet — run scan / dedup / plan / execute "
+            "and their durations will be recorded here.[/dim]"
+        )
+        return
+
+    table = Table(title="Command timing history", title_style="bold cyan")
+    table.add_column("Command", style="bold")
+    table.add_column("Runs", justify="right")
+    table.add_column("Last", justify="right")
+    table.add_column("Avg", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Max", justify="right")
+    table.add_column("Last run (UTC)", style="dim")
+
+    for r in rows:
+        last_at = (r["last_at"] or "")[:19].replace("T", " ")
+        cmd = r["command"]
+        if r["last_status"] and r["last_status"] != "ok":
+            cmd += f" [{r['last_status']}]"
+        table.add_row(
+            cmd,
+            f"{r['runs']:,}",
+            _fmt_duration(r["last_s"]),
+            _fmt_duration(r["avg_s"]),
+            _fmt_duration(r["min_s"]),
+            _fmt_duration(r["max_s"]),
+            last_at,
+        )
+    console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -546,6 +628,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_reclass.set_defaults(func=cmd_reclassify)
 
+    # timings
+    p_timings = sub.add_parser(
+        "timings", parents=[shared],
+        help="Show how long each command (scan/dedup/plan/execute/…) took — "
+             "runs, last/avg/min/max wall-clock time (DB only, no disk read)",
+    )
+    p_timings.set_defaults(func=cmd_timings)
+
     # review
     p_review = sub.add_parser(
         "review", parents=[shared],
@@ -586,20 +676,42 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    command = getattr(args, "command", "?")
+
+    started_iso = datetime.now(timezone.utc).isoformat()
+    t0 = time.monotonic()
+    status = "ok"
     try:
         args.func(args)
-    except SchemaVersionError as e:
-        print_error(str(e))
-        sys.exit(1)
-    except FileNotFoundError as e:
-        print_error(str(e))
-        sys.exit(1)
     except KeyboardInterrupt:
+        status = "interrupted"
         console.print("\n[yellow]Interrupted — progress saved, safe to resume.[/yellow]")
         sys.exit(0)
+    except (SchemaVersionError, FileNotFoundError) as e:
+        status = "error"
+        print_error(str(e))
+        sys.exit(1)
+    except SystemExit as e:
+        # Handlers call sys.exit() directly; non-zero code means failure.
+        status = "error" if (e.code not in (0, None)) else "ok"
+        raise
     except Exception as e:
+        status = "error"
         print_error(f"Unexpected error: {e}")
         raise
+    finally:
+        duration = time.monotonic() - t0
+        finished_iso = datetime.now(timezone.utc).isoformat()
+        # Don't clutter output for the timings view itself.
+        if command != "timings":
+            tag = "" if status == "ok" else f" [{status}]"
+            console.print(
+                f"[dim]⏱  {command} finished in "
+                f"{_fmt_duration(duration)}{tag}[/dim]"
+            )
+        _persist_timing(
+            args, command, started_iso, finished_iso, duration, status
+        )
 
 
 if __name__ == "__main__":
