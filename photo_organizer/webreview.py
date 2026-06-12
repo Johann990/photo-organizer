@@ -40,6 +40,7 @@ from pathlib import Path
 
 from PIL import Image, ImageFilter, ImageStat
 
+from . import imaging  # noqa: F401 — registers HEIC opener with Pillow on import
 from .db import Database
 from .planner import keep_score
 from .progress import console, print_phase_header, print_success

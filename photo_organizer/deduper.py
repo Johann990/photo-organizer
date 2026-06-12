@@ -18,6 +18,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image
 
+from . import imaging  # noqa: F401 — registers HEIC opener with Pillow on import
 from .bktree import BKTree
 from .db import Database
 from .progress import (

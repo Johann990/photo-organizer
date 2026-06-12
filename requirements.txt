@@ -1,0 +1,10 @@
+# Photo Organizer — Python dependencies
+# Install: pip install -r requirements.txt
+#
+# External (non-pip) tool: ExifTool — https://exiftool.org
+#   rename to exiftool.exe and add to PATH (used by scan for dates & metadata)
+
+Pillow>=11.1.0          # image decode + thumbnail (dedup pHash, web review)
+ImageHash>=4.3.2        # perceptual hash (near-duplicate detection)
+rich>=13.0.0            # progress bars / console output
+pillow-heif>=1.4.0      # HEIC/HEIF decode — required for iPhone .heic pHash
