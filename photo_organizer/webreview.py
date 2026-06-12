@@ -187,6 +187,8 @@ def record_selection(
     kept: set[int],
     dropped: set[int],
     hamming: int,
+    meta: dict[int, dict] | None = None,
+    known: set[str] | None = None,
 ) -> None:
     """Record a web review selection through the existing `_record_decision`.
 
@@ -205,9 +207,12 @@ def record_selection(
         _record_decision(db, members, next(iter(kept)), hamming)
         return
 
-    # Multi-keep: every dropped frame loses to one stable keeper.
-    keeper = max(kept, key=lambda f: f)  # deterministic; identity of keeper
-    for loser in dropped:                # only matters as "a survivor", any kept
+    # Multi-keep: pick the best keeper by keep_score when metadata is available.
+    if meta is not None and known is not None:
+        keeper = max(kept, key=lambda f: keep_score(meta[f], known))
+    else:
+        keeper = max(kept, key=lambda f: f)  # fallback: deterministic by file_id
+    for loser in dropped:
         _record_decision(db, [keeper, loser], keeper, hamming)
 
     # Close the rest of the cluster (kept↔kept, kept↔other) as keep-all so plan
@@ -227,9 +232,11 @@ def apply_decision(
     kept: set[int],
     dropped: set[int],
     hamming: int,
+    meta: dict[int, dict] | None = None,
+    known: set[str] | None = None,
 ) -> None:
     """Record one cluster decision and commit (the POST /decision target)."""
-    record_selection(db, members, kept, dropped, hamming)
+    record_selection(db, members, kept, dropped, hamming, meta, known)
     db.commit()
 
 
@@ -262,6 +269,8 @@ class ReviewState:
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
+
+_MAX_POST_BYTES = 64 * 1024  # cluster decisions are tiny; cap to prevent memory DoS
 
 _PAGE_CSS = """
 :root { color-scheme: dark; }
@@ -432,16 +441,26 @@ def _make_handler(state: ReviewState):
             if self.path != "/decision":
                 self._send(404, b"not found", "text/plain")
                 return
+            host = self.headers.get("Host", "").split(":")[0]
+            if host not in ("127.0.0.1", "localhost"):
+                self._send(403, b"forbidden", "text/plain")
+                return
             try:
-                length = int(self.headers.get("Content-Length", 0))
+                length = min(
+                    int(self.headers.get("Content-Length", 0)),
+                    _MAX_POST_BYTES,
+                )
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 idx = int(payload["cluster"])
                 members = state.clusters[idx]
-                kept = set(payload.get("kept", []))
-                dropped = set(payload.get("dropped", []))
+                member_set = set(members)
+                # Reject any file_id that is not a member of this cluster.
+                kept = {int(f) for f in payload.get("kept", [])} & member_set
+                dropped = {int(f) for f in payload.get("dropped", [])} & member_set
                 with state.lock:
                     apply_decision(state.db, members, kept, dropped,
-                                   state.hamming(members))
+                                   state.hamming(members),
+                                   meta=state.meta, known=state.known)
                 self._send(200, b'{"ok":true}', "application/json")
             except (KeyError, ValueError, IndexError, TypeError) as exc:
                 self._send(400, json.dumps({"error": str(exc)}).encode(),

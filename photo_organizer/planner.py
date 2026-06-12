@@ -589,7 +589,8 @@ def audit_dates(db: Database, today: date | None = None) -> dict[str, int]:
             "high": counts["HIGH"], "medium": counts["MEDIUM"]}
 
 
-def plan(db: Database, target_root: Path, force: bool = False) -> None:
+def plan(db: Database, target_root: Path, force: bool = False,
+         assume_yes: bool = False) -> None:
     """
     Phase 4: build the operations table and prompt the user to confirm.
 
@@ -598,6 +599,8 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
     target_root:
         Root of the reorganised library.  Must be on the same volume as the
         source photos so that Phase 5 can use os.rename() (no data copy).
+    assume_yes:
+        Skip the interactive confirmation prompt and auto-confirm the plan.
     """
     print_phase_header("4/5", "Action Plan")
 
@@ -908,23 +911,19 @@ def plan(db: Database, target_root: Path, force: bool = False) -> None:
         )
 
     # ── 6. Confirm ───────────────────────────────────────────────────────────
-    try:
-        ans = input(
-            "Mark all operations as confirmed and proceed to Phase 5? [y/N] "
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[yellow]Cancelled — no operations confirmed.[/yellow]")
-        db.conn.execute("DELETE FROM operations WHERE status = 'planned'")
-        db.commit()
-        db.set_phase_status("review", "pending")
-        return
-
-    if ans != "y":
-        console.print("[yellow]Cancelled — no operations confirmed.[/yellow]")
-        db.conn.execute("DELETE FROM operations WHERE status = 'planned'")
-        db.commit()
-        db.set_phase_status("review", "pending")
-        return
+    if not assume_yes:
+        try:
+            ans = input(
+                "Mark all operations as confirmed and proceed to Phase 5? [y/N] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans != "y":
+            console.print("\n[yellow]Cancelled — no operations confirmed.[/yellow]")
+            db.conn.execute("DELETE FROM operations WHERE status = 'planned'")
+            db.commit()
+            db.set_phase_status("review", "pending")
+            return
 
     db.conn.execute(
         "UPDATE operations SET status = 'confirmed' WHERE status = 'planned'"

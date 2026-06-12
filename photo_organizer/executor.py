@@ -149,8 +149,8 @@ def execute(
         print_success("Phase 5 already complete. Use --force to re-run.")
         return
 
-    # ── Load confirmed operations (optionally filtered) ───────────────────────
-    where = ["o.status = 'confirmed'"]
+    # ── Load confirmed (and any crashed in_progress) operations ──────────────
+    where = ["o.status IN ('confirmed', 'in_progress')"]
     params: list = []
     if year:
         where.append("substr(f.datetime_original, 1, 4) = ?")
@@ -226,17 +226,48 @@ def execute(
             dst = Path(op["target_path"])
 
             if not src.exists():
+                # Crash-recovery path: if this op was in_progress and src is
+                # gone, the rename may have already completed before the DB was
+                # updated. Check the recorded target: if it's there, seal it as
+                # done; otherwise the file is unaccounted for.
+                if op["status"] == "in_progress" and dst.exists():
+                    db.log(
+                        "WARN",
+                        "Crash-recovery: rename already completed (src gone, dst present) "
+                        "— marking done.",
+                        phase="execute", file_id=op["file_id"], path=str(dst),
+                    )
+                    now = _now()
+                    db.conn.execute(
+                        "UPDATE operations SET status='done', executed_at=? WHERE op_id=?",
+                        (now, op["op_id"]),
+                    )
+                    db.conn.execute(
+                        "UPDATE files SET status='done', path=?, updated_at=? WHERE file_id=?",
+                        (str(dst), now, op["file_id"]),
+                    )
+                    count_by_type[op["op_type"]] = count_by_type.get(op["op_type"], 0) + 1
+                    done += 1
+                else:
+                    db.conn.execute(
+                        "UPDATE operations SET status='skipped', error_msg='source not found' "
+                        "WHERE op_id=?",
+                        (op["op_id"],),
+                    )
+                    db.log(
+                        "WARN", "Source not found — already moved?",
+                        phase="execute", file_id=op["file_id"], path=str(src),
+                    )
+                    skipped += 1
+            else:
+                # Mark in_progress before the rename so a crash leaves a
+                # detectable intermediate state rather than a stuck 'confirmed'.
                 db.conn.execute(
-                    "UPDATE operations SET status='skipped', error_msg='source not found' "
-                    "WHERE op_id=?",
+                    "UPDATE operations SET status='in_progress' WHERE op_id=?",
                     (op["op_id"],),
                 )
-                db.log(
-                    "WARN", "Source not found — already moved?",
-                    phase="execute", file_id=op["file_id"], path=str(src),
-                )
-                skipped += 1
-            else:
+                db.commit()
+
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
 

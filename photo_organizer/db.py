@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS operations (
     source_path  TEXT    NOT NULL,
     target_path  TEXT,
     status       TEXT    NOT NULL DEFAULT 'planned'
-                 CHECK(status IN ('planned','confirmed','done','error','skipped')),
+                 CHECK(status IN ('planned','confirmed','in_progress','done','error','skipped')),
     error_msg    TEXT,
     planned_at   TEXT,
     executed_at  TEXT
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
 # SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
 # guard, not the migration mechanism: migrations stay idempotent ALTERs.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
@@ -203,6 +203,50 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()
 
     _migrate_filetype_check(conn)
+    _migrate_operations_check(conn)
+
+
+def _migrate_operations_check(conn: sqlite3.Connection) -> None:
+    """
+    Add 'in_progress' to the operations.status CHECK constraint.
+
+    SQLite cannot ALTER a CHECK constraint, so we rebuild the table when the
+    existing schema is missing the new value. No-op on fresh DBs and already-
+    migrated ones.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='operations'"
+    ).fetchone()
+    if not row or not row[0] or "'in_progress'" in row[0]:
+        return  # already up to date
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(operations)").fetchall()]
+    col_list = ", ".join(cols)
+    new_schema = SCHEMA_SQL.replace(
+        "CREATE TABLE IF NOT EXISTS operations (",
+        "CREATE TABLE operations_new (",
+        1,
+    )
+    start = new_schema.index("CREATE TABLE operations_new (")
+    end = new_schema.index(");", start) + 2
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(new_schema[start:end])
+        conn.execute(
+            f"INSERT INTO operations_new ({col_list}) SELECT {col_list} FROM operations"
+        )
+        conn.execute("DROP TABLE operations")
+        conn.execute("ALTER TABLE operations_new RENAME TO operations")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ops_file   ON operations(file_id)")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
@@ -440,13 +484,18 @@ class Database:
     def iter_files(
         self,
         file_type: str | None = None,
+        file_types: list[str] | None = None,
         status: str | None = None,
         batch_size: int = 500,
     ) -> Iterator[list[sqlite3.Row]]:
         """Yield batches of file rows for memory-efficient iteration."""
         where_clauses = []
         params: list[Any] = []
-        if file_type:
+        if file_types:
+            ph = ",".join("?" * len(file_types))
+            where_clauses.append(f"file_type IN ({ph})")
+            params.extend(file_types)
+        elif file_type:
             where_clauses.append("file_type = ?")
             params.append(file_type)
         if status:
@@ -462,7 +511,24 @@ class Database:
                 break
             yield batch
 
+    _UPDATABLE_FILE_COLS: frozenset[str] = frozenset({
+        "path", "filename", "extension", "size_bytes", "mtime",
+        "file_type", "datetime_original", "datetime_digitized",
+        "camera_make", "camera_model", "width", "height",
+        "gps_lat", "gps_lon", "gps_alt", "lens_model",
+        "iso", "aperture", "shutter_speed", "focal_length", "software",
+        "sha256", "phash",
+        "rating", "keywords", "description", "label",
+        "duration_seconds", "video_codec", "frame_rate",
+        "raw_pair_id", "jpeg_pair_id",
+        "status", "error_msg", "scanned_at", "updated_at",
+        "date_source", "date_confidence",
+    })
+
     def update_file(self, file_id: int, **kwargs):
+        unknown = set(kwargs) - self._UPDATABLE_FILE_COLS
+        if unknown:
+            raise ValueError(f"update_file: unknown column(s): {sorted(unknown)}")
         kwargs["updated_at"] = _now()
         set_clause = ", ".join(f"{k} = :{k}" for k in kwargs)
         kwargs["file_id"] = file_id

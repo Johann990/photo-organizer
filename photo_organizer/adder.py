@@ -211,26 +211,37 @@ def _new_event_spans(rows: list[Any]) -> dict[str, dict]:
 # Near-dupe index over the EXISTING library — BKTree preferred, brute fallback
 # ---------------------------------------------------------------------------
 
+def _build_near_tree(existing_by_int: dict[int, list[int]]):
+    """
+    Build a BKTree from all existing pHash ints. Returns the tree, or None if
+    the bktree module is unavailable (caller falls back to brute force).
+    Call ONCE before the per-file query loop — not inside it.
+    """
+    try:
+        from .bktree import BKTree
+    except ImportError:
+        return None
+    tree = BKTree()
+    tree.add_many(existing_by_int.keys())
+    return tree
+
+
 def _query_near_index(existing_by_int: dict[int, list[int]], key: int,
-                      max_distance: int) -> list[tuple[int, int]]:
+                      max_distance: int, tree=None) -> list[tuple[int, int]]:
     """
     Return [(stored_int, hamming)] within max_distance of `key` among the
     existing library's pHash ints.
 
-    Prefers the BKTree backend (zero false negatives, ~O(log N) per query). Falls
-    back to a brute-force scan if photo_organizer.bktree is unavailable, so the
-    `add` near-dupe step works regardless of whether the BKTree task has merged.
+    Pass a pre-built BKTree via `tree` (see _build_near_tree) to avoid
+    rebuilding the index on every call. Falls back to brute-force when tree
+    is None (BKTree unavailable).
     """
-    try:
-        from .bktree import BKTree  # PREFERRED backend
-    except ImportError:
+    if tree is None:
         return [
             (k, bin(k ^ key).count("1"))
             for k in existing_by_int
             if bin(k ^ key).count("1") <= max_distance
         ]
-    tree = BKTree()
-    tree.add_many(existing_by_int.keys())
     return tree.query(key, max_distance)
 
 
@@ -270,12 +281,16 @@ def plan_additions(
                 continue
             new_rows.append(row)
 
-    summary = {"new": len(new_rows), "moved": 0, "into_existing": 0,
-               "new_events": 0, "exact_dup": 0, "near_dup": 0}
+    summary: dict[str, Any] = {
+        "new": len(new_rows), "moved": 0, "into_existing": 0,
+        "new_events": 0, "exact_dup": 0, "near_dup": 0,
+        "_new_ids": [],  # kept internal; add() uses this for scoped ops
+    }
     if not new_rows:
         return summary
 
     new_ids = [row["file_id"] for row in new_rows]
+    summary["_new_ids"] = new_ids
 
     # Idempotency: clear only this file-set's pending ops; never 'done' ops.
     ph = ",".join("?" * len(new_ids))
@@ -327,15 +342,25 @@ def plan_additions(
     # Build the existing index from 'done' images that carry a pHash; query each
     # new image against it. Near-dupes are recorded for review, never auto-staged.
     existing_by_int: dict[int, list[int]] = defaultdict(list)
+    _old_format_count = 0
     for r in db.conn.execute(
         "SELECT file_id, phash FROM files WHERE status = 'done' AND phash IS NOT NULL"
     ).fetchall():
         try:
             existing_by_int[int(r["phash"], 16)].append(r["file_id"])
         except (TypeError, ValueError):
-            continue
+            _old_format_count += 1
+
+    if _old_format_count:
+        print_warning(
+            f"{_old_format_count:,} existing pHash value(s) are in the old signed-INTEGER "
+            "format and were skipped — near-dup detection against those files is disabled. "
+            "Fix: python scripts/migrate_phash_to_hex.py <db_path>"
+        )
 
     if existing_by_int:
+        # Build the BKTree ONCE before the per-file loop (O(N log N) total, not per file).
+        near_tree = _build_near_tree(existing_by_int)
         for row in new_rows:
             if row["file_id"] in stage_ids or not row["phash"]:
                 continue
@@ -343,7 +368,9 @@ def plan_additions(
                 key = int(row["phash"], 16)
             except (TypeError, ValueError):
                 continue
-            for b_int, hamming in _query_near_index(existing_by_int, key, hamming_threshold):
+            for b_int, hamming in _query_near_index(
+                existing_by_int, key, hamming_threshold, near_tree
+            ):
                 for existing_fid in existing_by_int[b_int]:
                     db.insert_duplicate(row["file_id"], existing_fid, "NEAR", hamming)
                     summary["near_dup"] += 1
@@ -483,21 +510,30 @@ def add(
         print_success("No new files to add — the library is already up to date.")
         return summary
 
+    batch_ids: list[int] = summary.pop("_new_ids", [])
+    ph = ",".join("?" * len(batch_ids)) if batch_ids else "0"
+
     if not _confirm(summary, target_root, assume_yes):
         console.print("[yellow]Cancelled — no operations confirmed.[/yellow]")
-        db.conn.execute(
-            "DELETE FROM operations WHERE status = 'planned'"
-        )
+        if batch_ids:
+            db.conn.execute(
+                f"DELETE FROM operations WHERE status = 'planned' AND file_id IN ({ph})",
+                batch_ids,
+            )
         db.commit()
         return summary
 
-    db.conn.execute(
-        "UPDATE operations SET status = 'confirmed' WHERE status = 'planned'"
-    )
-    db.conn.execute(
-        "UPDATE files SET status = 'confirmed' "
-        "WHERE file_id IN (SELECT file_id FROM operations WHERE status = 'confirmed')"
-    )
+    if batch_ids:
+        db.conn.execute(
+            f"UPDATE operations SET status = 'confirmed' "
+            f"WHERE status = 'planned' AND file_id IN ({ph})",
+            batch_ids,
+        )
+        db.conn.execute(
+            f"UPDATE files SET status = 'confirmed' "
+            f"WHERE file_id IN ({ph})",
+            batch_ids,
+        )
     db.commit()
     print_success(
         f"{summary['moved']:,} new files planned "

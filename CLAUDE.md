@@ -260,3 +260,5 @@ python -m photo_organizer undo --db C:\photos.db
 
 - `--target` 必須與照片來源在同一碟機（`os.rename()` 不跨碟）
 - ExifTool for Windows：https://exiftool.org → 重新命名為 `exiftool.exe` 加入 PATH
+- **知識庫 / Knowledge store**：`docs/solutions/` — 已記錄的 bugs、最佳實踐與架構決策（含 YAML frontmatter：`module`、`tags`、`problem_type`），實作或除錯時可參考。/ documented solutions organized by category with YAML frontmatter — relevant when implementing or debugging in documented areas.
+- **領域詞彙 / Domain vocabulary**：`CONCEPTS.md` — 專案特有術語的精確定義，新進工程師入門或閱讀 docs/solutions/ 時可查。/ precise definitions for project-specific terms; consult when reading docs/solutions/ or onboarding.
