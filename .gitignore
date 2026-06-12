@@ -1,6 +1,3 @@
-# ── Duplicate source directory (photo_organizer/ is the canonical module)
-photo-organizer/
-
 # ── Personal config (copy config.example.json → config.json to get started)
 config.json
 
@@ -25,7 +22,8 @@ build/
 venv/
 env/
 
-# ── Linter cache
+# ── Test / linter cache
+.pytest_cache/
 .ruff_cache/
 
 # ── Archives
