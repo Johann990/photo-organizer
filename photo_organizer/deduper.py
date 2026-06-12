@@ -12,7 +12,9 @@ No files are moved or deleted here.
 from __future__ import annotations
 
 import hashlib
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool
 from pathlib import Path
 
 import imagehash
@@ -81,6 +83,83 @@ def _phash_file(path: Path) -> str | None:
 
 def _phash_file_row(row) -> tuple[int, str, str | None]:
     return row["file_id"], row["path"], _phash_file(Path(row["path"]))
+
+
+# ---------------------------------------------------------------------------
+# Near-duplicate pair search (parallel BK-tree)
+# ---------------------------------------------------------------------------
+#
+# Finding all distinct-hash pairs within `threshold` is CPU-bound and
+# embarrassingly parallel: each BK-tree query is independent and the tree is
+# read-only once built. We split the distinct hashes across worker processes;
+# each worker builds its own tree (cheap vs. the query cost it amortises) and
+# queries its slice. multiprocessing sidesteps the GIL that would otherwise
+# serialise the popcount-heavy queries.
+
+# Per-process BK-tree, built once by the Pool initializer and reused for every
+# chunk that worker handles (avoids rebuilding the tree per chunk).
+_WORKER_TREE: BKTree | None = None
+
+# Below this many distinct hashes the multiprocessing spawn overhead isn't
+# worth it — run serially in-process instead.
+_PARALLEL_MIN_KEYS = 2_000
+
+
+def _init_pair_worker(all_keys: list[int]) -> None:
+    global _WORKER_TREE
+    _WORKER_TREE = BKTree()
+    _WORKER_TREE.add_many(all_keys)
+
+
+def _query_pair_chunk(args):
+    """Worker: query a slice of keys against the per-process tree.
+
+    Returns (n_keys_processed, pairs) where each pair is (a, b, hamming) with
+    b > a so every unordered pair is emitted exactly once.
+    """
+    chunk_keys, threshold = args
+    tree = _WORKER_TREE
+    out: list[tuple[int, int, int]] = []
+    for a in chunk_keys:
+        for b, h in tree.query(a, threshold):
+            if b > a:
+                out.append((a, b, h))
+    return len(chunk_keys), out
+
+
+def _find_near_pairs(keys, threshold, n_proc=1, on_progress=None):
+    """Yield (a_int, b_int, hamming) for every distinct-hash pair within
+    `threshold`. Each unordered pair is emitted once (b > a).
+
+    Lossless: the serial (n_proc<=1) and parallel paths return the SAME set of
+    pairs — the parallel path only partitions which keys each worker queries.
+    `on_progress(n)` is called with the number of keys processed so far so the
+    caller can drive a progress bar.
+    """
+    keys = list(keys)
+
+    if n_proc <= 1:
+        tree = BKTree()
+        tree.add_many(keys)
+        for a in keys:
+            for b, h in tree.query(a, threshold):
+                if b > a:
+                    yield (a, b, h)
+            if on_progress:
+                on_progress(1)
+        return
+
+    # Round-robin slices balance load (interleaved keys → similar work each).
+    n_chunks = n_proc * 8
+    chunks = [keys[i::n_chunks] for i in range(n_chunks)]
+    chunks = [c for c in chunks if c]
+    with Pool(n_proc, initializer=_init_pair_worker, initargs=(keys,)) as pool:
+        for n_done, pairs in pool.imap_unordered(
+            _query_pair_chunk, [(c, threshold) for c in chunks]
+        ):
+            yield from pairs
+            if on_progress:
+                on_progress(n_done)
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +346,6 @@ def dedup_near(
     # Distinct 16-char hex pHash → its 64-bit int value.
     ph_by_int: dict[int, str] = {int(ph, 16): ph for ph in phash_index}
 
-    tree = BKTree()
-    tree.add_many(ph_by_int.keys())
-
     _PAIR_FLUSH = 10_000   # executemany every N pairs — big batches amortise overhead
     pair_buf: list[tuple[int, int, str, int]] = []
 
@@ -282,34 +358,37 @@ def dedup_near(
         buf.clear()
         return n
 
+    # Exact perceptual matches (same hash → multiple files) are independent of
+    # the distance search; emit them up front, single-pass and cheap.
+    for ids in phash_index.values():
+        if len(ids) > 1:
+            for x in range(len(ids)):
+                for y in range(x + 1, len(ids)):
+                    pair_buf.append((ids[x], ids[y], "NEAR", 0))
+    near_pairs += _flush(pair_buf)
+
+    # Distinct-hash pairs within the threshold — parallelised across cores.
+    # CPU-bound and independent per query, so use processes (not the I/O-tuned
+    # `workers` count, which is kept low for spinning disks during hashing).
+    n_keys = len(ph_by_int)
+    n_proc = 1 if n_keys < _PARALLEL_MIN_KEYS else max(1, (os.cpu_count() or 2) - 1)
+    if n_proc > 1:
+        console.print(f"  Searching {n_keys:,} distinct hashes across {n_proc} processes…")
+
     with PhaseProgress(
         "Finding near-duplicate pairs (Hamming distance)",
-        total=len(ph_by_int),
+        total=n_keys,
         phase="3B",
     ) as p:
-        for a_int, ph_a in ph_by_int.items():
-            ids_a = phash_index[ph_a]
-
-            # Same hash = exact perceptual match (Hamming 0)
-            if len(ids_a) > 1:
-                for x in range(len(ids_a)):
-                    for y in range(x + 1, len(ids_a)):
-                        pair_buf.append((ids_a[x], ids_a[y], "NEAR", 0))
-
-            # All distinct hashes within the threshold — no false negatives.
-            for b_int, hamming in tree.query(a_int, hamming_threshold):
-                # Emit each unordered pair once; skip self (==) and reverse (<).
-                if b_int <= a_int:
-                    continue
-                ph_b = ph_by_int[b_int]
-                for id_a in ids_a:
-                    for id_b in phash_index[ph_b]:
-                        pair_buf.append((id_a, id_b, "NEAR", hamming))
-
+        for a_int, b_int, hamming in _find_near_pairs(
+            ph_by_int.keys(), hamming_threshold,
+            n_proc=n_proc, on_progress=p.advance,
+        ):
+            for id_a in phash_index[ph_by_int[a_int]]:
+                for id_b in phash_index[ph_by_int[b_int]]:
+                    pair_buf.append((id_a, id_b, "NEAR", hamming))
             if len(pair_buf) >= _PAIR_FLUSH:
                 near_pairs += _flush(pair_buf)
-
-            p.advance(1)
 
     near_pairs += _flush(pair_buf)
 
