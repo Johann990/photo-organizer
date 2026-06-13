@@ -111,11 +111,14 @@ python -m photo_organizer execute --db C:\photos.db
 - **near-dupe review 與 plan 的關係 / review × plan**：`review` 只把決策寫進 `duplicates` 表（`status='reviewed'` + `keep_file_id`），**不直接建搬移操作**。實際的 `STAGE_DELETE` 由 `plan` 讀取這些決策後建立 → 因此**請在 `plan` 之前跑 `review`**（或事後重跑 `plan`）。如此 `plan --force` 重建計畫時也不會清掉人工審查結果，敗者也不會同時被建 MOVE。
   / `review` records decisions only; `plan` creates the STAGE_DELETE for each loser. Run `review` before `plan` (or re-run `plan`). `plan --force` no longer wipes review decisions.
 
-- **縮圖／縮小副本自動清除 / Resized-copy auto-staging**（`planner.resize_loser_ids`）：很多照片有同一張的縮小版（網路圖、分享匯出、縮圖），它們**位元組與大圖不同**（重新編碼）所以 EXACT SHA-256 抓不到、又因縮太多 **pHash 漂走** near 也配不上 → 會漏網污染 review。`plan` 會用「**拍攝簽章**」=（檔名 stem + EXIF `datetime_original`）把同一張的各版本分組，**只留最大的**（keep_score），把**同長寬比、嚴格較小**的版本標為 `STAGE_DELETE`（預覽列「Resized/downscaled copies」）。
-  - **鐵則：必須有更大的版本存活才會刪 / never stage unless a larger sibling survives**——唯一／最大的副本永不進待刪區（「略小也要保留」）。裁切（長寬比不同）與旋轉版本因比例不符故**不視為**縮小副本、會保留。無 `datetime_original` 的檔案不比對。
-  - **安全網豁免 / safety-net exemption**：縮小副本的內容由**不同 sha 的大圖**保住，故 `plan` 1d 安全網（「絕不把某 sha 群組全部 stage」）會**豁免** RESIZED/縮小副本，否則單檔 sha 的縮圖會被誤救回。
-  - 也會**排除出 near review**（同 EXACT 敗者）→ 進一步減少人工審查。純算 DB、不讀碟、idempotent。
-  / `plan` groups each shot's versions by (filename stem + EXIF capture time), keeps the largest, and stages strictly-smaller same-aspect copies — content is preserved by the larger original (a different sha EXACT can't catch). A copy is staged ONLY when a larger sibling survives; crops/rotations (different aspect) are kept. These are exempt from the 1d byte-survival net and excluded from near review.
+- **重複副本自動清除 / Redundant-copy auto-staging**（`planner.redundant_copy_ids`）：同一張照片常有多個版本——重新存過的 JPEG（**位元組不同** EXACT SHA-256 抓不到）、分享匯出、縮圖（**改了檔名**或縮太多 **pHash 漂走** near 也配不上）→ 漏網污染 review。`plan` 用兩個**各自安全**的訊號把同一張的多餘版本標為 `STAGE_DELETE`（預覽列「Redundant copies (re-encodes + resizes)」），每張保留最佳版（keep_score）：
+  - **Rule A — 重編碼／改名匯出**：**同 EXIF `datetime_original` + 同 pHash**（非垃圾雜湊）= 同一張內容（同一秒拍攝 + 同感知雜湊）→ 留最佳，其餘全收（含**同尺寸**重編碼、含**改過檔名**的縮圖如 `image00017.jpg`）。
+  - **Rule B — pHash 漂走的縮圖**：同（檔名 stem + `datetime_original`）群組裡，**同長寬比、嚴格較小**者為純縮放 → 收（補抓 Rule A 因 pHash 差太遠漏掉的重縮圖，靠檔名）。
+  - **鐵則：必有更佳版本存活才刪 / never stage unless a better sibling survives**——唯一／最佳版永不進待刪區。Rule A 的 keeper（某 pHash 內容的最佳版）絕不被 Rule B 誤刪。裁切／旋轉（長寬比不同）保留。**RAW／VIDEO 不在範圍**，RAW 主檔永遠保留。無 `datetime_original` 不比對。
+  - **垃圾雜湊排除 / junk-phash excluded**：同一 pHash 被 ≥`JUNK_PHASH_MIN_FILES`（8，與 near 共用單一來源）個檔共用 → 低資訊量假碰撞，不據以判同。
+  - **安全網豁免 / safety-net exemption**：多餘副本的內容由**不同 sha 的更佳版**保住，故 `plan` 1d 安全網（「絕不把某 sha 群組全部 stage」）會**豁免** RESIZED／重複副本，否則單檔 sha 的副本會被誤救回。
+  - 也會**排除出 near review** → 大幅減少人工審查。純算 DB、不讀碟、idempotent。
+  / `plan` stages redundant copies of a shot, keeping the keep_score best, via two safe signals: Rule A groups by (EXIF capture time + identical non-junk pHash) — catches same-size re-encodes (different sha EXACT misses) and renamed exports; Rule B groups by (filename stem + capture time) and stages strictly-smaller same-aspect downscales whose pHash drifted. A copy is staged ONLY when a better sibling survives; a Rule A keeper is never staged by Rule B. RAW/VIDEO are out of scope (RAW masters always kept), junk pHashes (shared by ≥8 files) are excluded, these are exempt from the 1d byte-survival net, and excluded from near review.
 
 ### 增量維護 / Incremental add（`add`）
 

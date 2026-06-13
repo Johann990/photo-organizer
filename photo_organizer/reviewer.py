@@ -41,7 +41,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .db import Database
-from .planner import keep_score, resize_loser_ids
+from .planner import JUNK_PHASH_MIN_FILES, keep_score, redundant_copy_ids
 from .progress import console, print_phase_header, print_success, print_warning
 
 # A pHash computed from one of these is meaningless and collides with unrelated
@@ -62,7 +62,8 @@ _CLUSTER_HAMMING = 2
 # (night/dark, flat backgrounds) collapse to near-identical hashes, so unrelated
 # photos collide (e.g. a moon shot == a notebook).  Such hashes are excluded from
 # clustering entirely — they only ever produce false near-duplicate pairs.
-_JUNK_PHASH_MIN_FILES = 8
+# Single source of truth lives in planner (also used by redundant_copy_ids).
+_JUNK_PHASH_MIN_FILES = JUNK_PHASH_MIN_FILES
 
 
 def _now() -> str:
@@ -211,9 +212,9 @@ def _excluded_from_near(
     if junk_ph:
         excluded.update(f for f in near_ids if meta[f].get("phash") in junk_ph)
 
-    # (3) Resized / downscaled copies — plan stages these (a larger original
-    #     survives), so like EXACT losers they should not appear for review.
-    excluded.update(f for f in resize_loser_ids(db) if f in near_ids)
+    # (3) Redundant copies (re-encodes + resizes) — plan stages these (a better
+    #     copy survives), so like EXACT losers they should not appear for review.
+    excluded.update(f for f in redundant_copy_ids(db) if f in near_ids)
 
     return excluded
 

@@ -426,38 +426,76 @@ def _pick_keeper(db: Database, group: list[int], known_cameras: set[str]) -> int
 # or rotation changes it, so those are NOT treated as resize copies.
 _RESIZE_ASPECT_TOL = 0.02
 
+# A pHash shared by this many files is non-discriminative (low-information image:
+# dark/flat) and collides across unrelated photos, so it must never drive a
+# content-equality decision.  Shared with reviewer's near-cluster junk filter.
+JUNK_PHASH_MIN_FILES = 8
 
-def resize_loser_ids(db: Database) -> set[int]:
-    """file_ids that are smaller-resolution copies of a larger same-shot sibling.
 
-    A "shot signature" is (normalized filename stem, EXIF datetime_original):
-    a resize preserves both the camera filename and the capture timestamp, while
-    two genuinely different shots never collide on stem AND exact second.  Within
-    each signature group the largest-area file (by keep_score) is the keeper; any
-    STRICTLY-smaller file sharing the keeper's aspect ratio is a pure downscale →
-    a loser.
+def redundant_copy_ids(db: Database) -> set[int]:
+    """file_ids that are redundant copies of a shot whose better version survives.
 
-    Safety: a file is a loser ONLY when a larger sibling exists, so the unique /
-    largest copy of a shot is never staged ("a resized photo needs a bigger one
-    to exist before it can go").  Files without datetime_original are never
-    matched.  DB-only — no disk read; uses width/height/datetime already stored.
+    Two complementary, independently-safe signals.  A copy is staged ONLY when a
+    superior sibling is KEPT, so the unique / best version of any content is never
+    touched.  RAW and VIDEO are out of scope (only CAMERA_JPEG/DEV_JPEG/HEIC), so
+    RAW masters are always kept.  DB-only — no disk read.
+
+    Rule A — re-encodes & renamed exports:
+        Files sharing an EXIF datetime_original AND an identical, non-junk pHash
+        are the same shot content (same capture second + same perceptual hash).
+        Keep the keep_score best; every other copy is redundant — a same-size
+        re-encode (different sha, so EXACT dedup misses it) or a downscale whose
+        pHash survived, EVEN IF the filename was changed (e.g. image00017.jpg).
+
+    Rule B — downscales whose pHash drifted:
+        Within a (stem, datetime_original) group, a STRICTLY-smaller file sharing
+        the keeper's aspect ratio is a pure downscale.  Catches heavy resizes that
+        Rule A misses because the pHash moved too far (filename preserved).
+
+    A Rule A keeper is the best copy of a distinct pHash content and is never
+    staged, so Rule B can't delete content that has no larger same-content copy.
     """
     rows = db.conn.execute(
         "SELECT file_id, filename, path, width, height, size_bytes, "
-        "camera_model, datetime_original FROM files "
+        "camera_model, datetime_original, phash FROM files "
         "WHERE file_type IN ('CAMERA_JPEG','DEV_JPEG','HEIC') "
         "AND datetime_original IS NOT NULL "
         "AND width > 0 AND height > 0"
     ).fetchall()
 
     known = db.get_known_camera_models()
-    groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
-    for r in rows:
-        stem = Path(r["filename"]).stem.strip().lower()
-        groups[(stem, r["datetime_original"])].append(r)
+    junk = {
+        r[0]
+        for r in db.conn.execute(
+            "SELECT phash FROM files WHERE phash IS NOT NULL "
+            "GROUP BY phash HAVING COUNT(*) >= ?",
+            (JUNK_PHASH_MIN_FILES,),
+        )
+    }
 
     losers: set[int] = set()
-    for members in groups.values():
+    protected: set[int] = set()  # Rule A keepers — best copy of a content, never staged
+
+    # ── Rule A: datetime + identical (non-junk) pHash → same shot content ──
+    by_content: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for r in rows:
+        if r["phash"] and r["phash"] not in junk:
+            by_content[(r["datetime_original"], r["phash"])].append(r)
+    for members in by_content.values():
+        if len(members) < 2:
+            continue
+        keeper = max(members, key=lambda r: keep_score(r, known))
+        protected.add(keeper["file_id"])
+        for m in members:
+            if m["file_id"] != keeper["file_id"]:
+                losers.add(m["file_id"])
+
+    # ── Rule B: stem + datetime, strictly-smaller same-aspect downscale ──
+    by_shot: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for r in rows:
+        stem = Path(r["filename"]).stem.strip().lower()
+        by_shot[(stem, r["datetime_original"])].append(r)
+    for members in by_shot.values():
         if len(members) < 2:
             continue
         keeper = max(members, key=lambda r: keep_score(r, known))
@@ -467,10 +505,11 @@ def resize_loser_ids(db: Database) -> set[int]:
             if m["file_id"] == keeper["file_id"]:
                 continue
             if m["width"] * m["height"] >= k_area:
-                continue  # same-size sibling (tie) — left to exact dedup, not here
+                continue  # same-size sibling — handled by Rule A / exact dedup
             if abs(m["width"] / m["height"] - k_aspect) <= _RESIZE_ASPECT_TOL:
                 losers.add(m["file_id"])
-    return losers
+
+    return losers - protected
 
 
 # ---------------------------------------------------------------------------
@@ -732,15 +771,14 @@ def plan(db: Database, target_root: Path, force: bool = False,
         near_dup_losers.add(loser)
         stage_ids.add(loser)
 
-    # 1c-bis. Resized / downscaled copies — a smaller version of a shot whose
-    # larger original survives (different sha256, so EXACT dedup never catches
-    # them).  keeper = largest; only strictly-smaller same-aspect siblings are
-    # staged, so the unique/biggest copy is always kept.  Content is preserved by
-    # the larger original, so these are content-safe (exempt from the 1d net).
-    with console.status("Finding resized / downscaled copies…"):
-        resize_copy_losers = resize_loser_ids(db)
-    stage_ids.update(resize_copy_losers)
-    content_safe_stage.update(resize_copy_losers)
+    # 1c-bis. Redundant copies — re-encodes and downscales of a shot whose better
+    # version survives (different sha256, so EXACT dedup never catches them).
+    # keeper = best/largest; the redundant copies' content is preserved by that
+    # survivor, so they are content-safe (exempt from the 1d byte-survival net).
+    with console.status("Finding redundant copies (re-encodes + resizes)…"):
+        redundant_copy_losers = redundant_copy_ids(db)
+    stage_ids.update(redundant_copy_losers)
+    content_safe_stage.update(redundant_copy_losers)
 
     # 1d. Safety net — never stage EVERY byte-identical copy of a file.
     # EXACT and NEAR resolution choose keepers independently, so their staging
@@ -905,11 +943,11 @@ def plan(db: Database, target_root: Path, force: bool = False,
         f"{resized_n:,}",
         "path contains 'resized'",
     )
-    if resize_copy_losers:
+    if redundant_copy_losers:
         t.add_row(
-            "[red]Stage for deletion — Resized/downscaled copies[/red]",
-            f"{len(resize_copy_losers):,}",
-            "smaller copy of a shot; larger original kept",
+            "[red]Stage for deletion — Redundant copies (re-encodes + resizes)[/red]",
+            f"{len(redundant_copy_losers):,}",
+            "same shot, lower quality; best copy kept",
         )
     t.add_row(
         "[red]Stage for deletion — Exact duplicates[/red]",
