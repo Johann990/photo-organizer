@@ -111,6 +111,12 @@ python -m photo_organizer execute --db C:\photos.db
 - **near-dupe review 與 plan 的關係 / review × plan**：`review` 只把決策寫進 `duplicates` 表（`status='reviewed'` + `keep_file_id`），**不直接建搬移操作**。實際的 `STAGE_DELETE` 由 `plan` 讀取這些決策後建立 → 因此**請在 `plan` 之前跑 `review`**（或事後重跑 `plan`）。如此 `plan --force` 重建計畫時也不會清掉人工審查結果，敗者也不會同時被建 MOVE。
   / `review` records decisions only; `plan` creates the STAGE_DELETE for each loser. Run `review` before `plan` (or re-run `plan`). `plan --force` no longer wipes review decisions.
 
+- **縮圖／縮小副本自動清除 / Resized-copy auto-staging**（`planner.resize_loser_ids`）：很多照片有同一張的縮小版（網路圖、分享匯出、縮圖），它們**位元組與大圖不同**（重新編碼）所以 EXACT SHA-256 抓不到、又因縮太多 **pHash 漂走** near 也配不上 → 會漏網污染 review。`plan` 會用「**拍攝簽章**」=（檔名 stem + EXIF `datetime_original`）把同一張的各版本分組，**只留最大的**（keep_score），把**同長寬比、嚴格較小**的版本標為 `STAGE_DELETE`（預覽列「Resized/downscaled copies」）。
+  - **鐵則：必須有更大的版本存活才會刪 / never stage unless a larger sibling survives**——唯一／最大的副本永不進待刪區（「略小也要保留」）。裁切（長寬比不同）與旋轉版本因比例不符故**不視為**縮小副本、會保留。無 `datetime_original` 的檔案不比對。
+  - **安全網豁免 / safety-net exemption**：縮小副本的內容由**不同 sha 的大圖**保住，故 `plan` 1d 安全網（「絕不把某 sha 群組全部 stage」）會**豁免** RESIZED/縮小副本，否則單檔 sha 的縮圖會被誤救回。
+  - 也會**排除出 near review**（同 EXACT 敗者）→ 進一步減少人工審查。純算 DB、不讀碟、idempotent。
+  / `plan` groups each shot's versions by (filename stem + EXIF capture time), keeps the largest, and stages strictly-smaller same-aspect copies — content is preserved by the larger original (a different sha EXACT can't catch). A copy is staged ONLY when a larger sibling survives; crops/rotations (different aspect) are kept. These are exempt from the 1d byte-survival net and excluded from near review.
+
 ### 增量維護 / Incremental add（`add`）
 
 照片庫整理好之後，下個月又拍了 800 張——丟進一個新資料夾，跑一次 `add` 就好：
@@ -278,6 +284,11 @@ python -m photo_organizer undo --db C:\photos.db
 - ExifTool for Windows：https://exiftool.org → 重新命名為 `exiftool.exe` 加入 PATH
 - **HEIC 近似去重需 `pillow-heif`**：iPhone `.heic`/`.heif` 的感知雜湊（pHash）需要 `pip install pillow-heif`，否則這些檔案在 `dedup` 的近似比對會逐張失敗（記成 pHash error，不會中斷整體流程）。掃描／搬移不受影響（日期與分類走 ExifTool）。/ HEIC perceptual hashing needs `pillow-heif`; without it, HEIC files fail per-file in `dedup` near-match (logged, non-fatal). Scan/move are unaffected (date & classify use ExifTool).
 - **近似配對搜尋是平行的 / Near-dup pair search is parallel**：`dedup` 的 phase 3B 配對搜尋（BK-tree 查詢）為 CPU-bound，會用 `multiprocessing`（核心數−1 個 process）平行跑，對大型圖庫（十萬張級）是數量級的加速；與單執行緒結果**完全相同（無損）**。資料量小於門檻時自動退回單執行緒避免 spawn 開銷。`hamming_threshold`（config 或 `--hamming`）越低搜尋越快：`0–2` 幾乎相同、`3–4` 小編輯、`5–6` 中等相似、`7–8` 連拍/同場景。/ phase 3B pair search is parallelised across processes (lossless vs serial); lower `hamming_threshold` = faster and tighter matches.
+- **近似審查叢集的三道過濾 / Near-review cluster filters**（`reviewer._build_near_clusters`）：`dedup` 記錄**所有**門檻內的近似配對，但 `review`／`review --web` 把配對組成「審查叢集」時會再過濾三層，避免叢集被雜訊汙染（曾出現 111 張不相干照片串成一叢、頭尾 pHash 差 36 bits）：
+  1. **排除 EXACT 敗者**：位元組完全相同的複本（同 sha256）已由 `plan` stage，叢集只保留 `keep_score` 勝者，不重複列出、也不會與 EXACT 決策打架。
+  2. **排除垃圾 pHash**：同一個 pHash 被 ≥`_JUNK_PHASH_MIN_FILES`（預設 8）個檔案共用 → 屬低資訊量影像（夜景／暗／平淡背景）的假碰撞（例：月亮 == 筆記本），整批排除。
+  3. **緊門檻分群（`_CLUSTER_HAMMING`，預設 2）**：union-find 是單鏈接，會把 A~B~C…~Z 串起來；用比偵測門檻更緊的距離分群，才不會把不相干的 look-alike 連成巨叢。真正的連拍（同資料夾、秒級）仍會因每個**連結**都 ≤2 而正確聚在一起。
+  / `dedup` records every pair within threshold, but `review` filters three ways when forming review clusters: (1) exclude EXACT-dupe losers (already staged by plan), (2) exclude junk pHashes shared by ≥8 files (low-information collisions), (3) group only on pairs ≤`_CLUSTER_HAMMING` so single-linkage union-find can't chain unrelated look-alikes into a giant blob.
 - **知識庫 / Knowledge store**：`docs/solutions/` — 已記錄的 bugs、最佳實踐與架構決策（含 YAML frontmatter：`module`、`tags`、`problem_type`），實作或除錯時可參考。/ documented solutions organized by category with YAML frontmatter — relevant when implementing or debugging in documented areas.
 - **領域詞彙 / Domain vocabulary**：`CONCEPTS.md` — 專案特有術語的精確定義，新進工程師入門或閱讀 docs/solutions/ 時可查。/ precise definitions for project-specific terms; consult when reading docs/solutions/ or onboarding.
 

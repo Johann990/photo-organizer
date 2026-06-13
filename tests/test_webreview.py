@@ -260,7 +260,8 @@ def test_serve_decision_endpoint_round_trip(tmp_path):
     with Database(db_path) as db:
         _add_file(db, 1, "/a/IMG_001.jpg", "IMG_001.jpg", w=4000, h=3000)
         _add_file(db, 2, "/b/IMG_001.jpg", "IMG_001.jpg", w=800, h=600)
-        _add_near_pair(db, 1, 2, hamming=5)
+        # hamming must be within _CLUSTER_HAMMING so the pair forms a cluster.
+        _add_near_pair(db, 1, 2, hamming=2)
         db.commit()
 
         server = serve(db, review_all=True, port=0, open_browser=False,

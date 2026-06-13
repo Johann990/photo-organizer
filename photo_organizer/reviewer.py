@@ -41,12 +41,28 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .db import Database
-from .planner import keep_score
+from .planner import keep_score, resize_loser_ids
 from .progress import console, print_phase_header, print_success, print_warning
 
 # A pHash computed from one of these is meaningless and collides with unrelated
 # images, so such files must never drive a deletion decision.
 _MIN_DIM = 200
+
+# Near-cluster construction tunables (see _build_near_clusters).
+#
+# CLUSTER_HAMMING — clusters are built by single-linkage union-find, which CHAINS
+# (A~B~C…~Z, each link tight but endpoints unrelated).  At the detection
+# threshold (≤6–8) dense hash regions chain hundreds of unrelated photos into one
+# blob (observed: a 111-member "cluster" whose extremes were 36 bits apart).  We
+# therefore GROUP only on very-close pairs so a cluster is genuinely tight; looser
+# pairs still exist in the DB for reference but never drive grouping.
+_CLUSTER_HAMMING = 2
+
+# A pHash shared by this many files is non-discriminative: low-information images
+# (night/dark, flat backgrounds) collapse to near-identical hashes, so unrelated
+# photos collide (e.g. a moon shot == a notebook).  Such hashes are excluded from
+# clustering entirely — they only ever produce false near-duplicate pairs.
+_JUNK_PHASH_MIN_FILES = 8
 
 
 def _now() -> str:
@@ -59,18 +75,53 @@ def _now() -> str:
 
 def _build_near_clusters(
     db: Database,
+    cluster_threshold: int = _CLUSTER_HAMMING,
+    junk_phash_min: int = _JUNK_PHASH_MIN_FILES,
 ) -> tuple[list[list[int]], dict[int, dict], dict[int, int]]:
     """Return (clusters, meta, cluster_hamming).
 
     clusters         — list of file_id lists (each a connected component)
     meta             — file_id → row dict (path/dims/size/camera/…)
-    cluster_hamming  — root file_id → representative (min) Hamming distance
+    cluster_hamming  — first-member file_id → representative (min) Hamming
+
+    Three filters keep clusters tight and meaningful (see module constants):
+      1. EXACT-dupe losers are excluded — a byte-identical copy is already staged
+         by plan, so showing it here is redundant and could conflict with the
+         EXACT decision.  Only the keep_score winner of each sha256 group stays.
+      2. Junk (non-discriminative) pHashes are excluded — a hash shared by
+         ≥ junk_phash_min files is a low-information collision (dark/flat images),
+         producing only false near-duplicate pairs.
+      3. Grouping unions only pairs with hamming ≤ cluster_threshold, so a cluster
+         is genuinely tight rather than a chain of unrelated look-alikes.
     """
     pairs = db.conn.execute(
         "SELECT file_id_a, file_id_b, hamming_distance FROM duplicates "
         "WHERE dup_type='NEAR' AND status='pending'"
     ).fetchall()
 
+    near_ids: set[int] = set()
+    for p in pairs:
+        near_ids.add(p["file_id_a"])
+        near_ids.add(p["file_id_b"])
+    if not near_ids:
+        return [], {}, {}
+
+    # Load metadata for every file that appears in a pending NEAR pair.
+    meta: dict[int, dict] = {}
+    ids = list(near_ids)
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        q = (
+            "SELECT file_id, path, filename, width, height, size_bytes, "
+            "camera_model, datetime_original, sha256, phash "
+            "FROM files WHERE file_id IN (%s)" % ",".join("?" * len(chunk))
+        )
+        for r in db.conn.execute(q, chunk):
+            meta[r["file_id"]] = dict(r)
+
+    excluded = _excluded_from_near(db, near_ids, meta, junk_phash_min)
+
+    # ── union-find over ACCEPTED pairs only (tight + not excluded) ──────────
     parent: dict[int, int] = {}
 
     def find(x: int) -> int:
@@ -85,9 +136,17 @@ def _build_near_clusters(
         if ra != rb:
             parent[ra] = rb
 
+    def accepted(p) -> bool:
+        a, b = p["file_id_a"], p["file_id_b"]
+        if a in excluded or b in excluded:
+            return False
+        h = p["hamming_distance"] if p["hamming_distance"] is not None else 0
+        return h <= cluster_threshold
+
     min_h: dict[int, int] = {}
     for p in pairs:
-        union(p["file_id_a"], p["file_id_b"])
+        if accepted(p):
+            union(p["file_id_a"], p["file_id_b"])
 
     groups: dict[int, list[int]] = defaultdict(list)
     for fid in list(parent.keys()):
@@ -95,30 +154,68 @@ def _build_near_clusters(
 
     # representative hamming per cluster (smallest = most similar pair)
     for p in pairs:
+        if not accepted(p):
+            continue
         root = find(p["file_id_a"])
         h = p["hamming_distance"] if p["hamming_distance"] is not None else 0
         if root not in min_h or h < min_h[root]:
             min_h[root] = h
-    cluster_hamming = {root: min_h.get(root, 0) for root in groups}
-
-    # Load metadata for all involved files
-    meta: dict[int, dict] = {}
-    ids = list(parent.keys())
-    for i in range(0, len(ids), 900):
-        chunk = ids[i:i + 900]
-        q = (
-            "SELECT file_id, path, filename, width, height, size_bytes, "
-            "camera_model, datetime_original FROM files WHERE file_id IN (%s)"
-            % ",".join("?" * len(chunk))
-        )
-        for r in db.conn.execute(q, chunk):
-            meta[r["file_id"]] = dict(r)
 
     clusters = [groups[root] for root in groups]
     # remap cluster_hamming to first-member key for easy lookup
-    ch_by_first = {members[0]: cluster_hamming[find(members[0])]
+    ch_by_first = {members[0]: min_h.get(find(members[0]), 0)
                    for members in clusters}
     return clusters, meta, ch_by_first
+
+
+def _excluded_from_near(
+    db: Database,
+    near_ids: set[int],
+    meta: dict[int, dict],
+    junk_phash_min: int,
+) -> set[int]:
+    """file_ids that must not participate in near clusters (filters 1, 2 & 3)."""
+    excluded: set[int] = set()
+
+    # (1) EXACT-dupe losers.  sha256 connected-components equal the EXACT-pair
+    #     groups plan stages, and the same keep_score picks the same keeper, so
+    #     excluding the non-keepers here matches what plan will delete.
+    known = db.get_known_camera_models()
+    shas = sorted({meta[f]["sha256"] for f in near_ids if meta[f].get("sha256")})
+    for i in range(0, len(shas), 900):
+        chunk = shas[i:i + 900]
+        grp: dict[str, list[dict]] = defaultdict(list)
+        q = (
+            "SELECT file_id, path, width, height, size_bytes, camera_model, "
+            "sha256 FROM files WHERE sha256 IN (%s)" % ",".join("?" * len(chunk))
+        )
+        for r in db.conn.execute(q, chunk):
+            grp[r["sha256"]].append(dict(r))
+        for members in grp.values():
+            if len(members) < 2:
+                continue
+            keeper = max(members, key=lambda m: keep_score(m, known))["file_id"]
+            for m in members:
+                if m["file_id"] != keeper and m["file_id"] in near_ids:
+                    excluded.add(m["file_id"])
+
+    # (2) Junk (non-discriminative) pHashes.
+    junk_ph = {
+        row[0]
+        for row in db.conn.execute(
+            "SELECT phash FROM files WHERE phash IS NOT NULL "
+            "GROUP BY phash HAVING COUNT(*) >= ?",
+            (junk_phash_min,),
+        )
+    }
+    if junk_ph:
+        excluded.update(f for f in near_ids if meta[f].get("phash") in junk_ph)
+
+    # (3) Resized / downscaled copies — plan stages these (a larger original
+    #     survives), so like EXACT losers they should not appear for review.
+    excluded.update(f for f in resize_loser_ids(db) if f in near_ids)
+
+    return excluded
 
 
 # ---------------------------------------------------------------------------

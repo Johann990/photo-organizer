@@ -422,6 +422,57 @@ def _pick_keeper(db: Database, group: list[int], known_cameras: set[str]) -> int
     return max(rows, key=lambda r: keep_score(r, known_cameras))["file_id"]
 
 
+# Aspect-ratio equality tolerance — a pure downscale preserves the ratio; a crop
+# or rotation changes it, so those are NOT treated as resize copies.
+_RESIZE_ASPECT_TOL = 0.02
+
+
+def resize_loser_ids(db: Database) -> set[int]:
+    """file_ids that are smaller-resolution copies of a larger same-shot sibling.
+
+    A "shot signature" is (normalized filename stem, EXIF datetime_original):
+    a resize preserves both the camera filename and the capture timestamp, while
+    two genuinely different shots never collide on stem AND exact second.  Within
+    each signature group the largest-area file (by keep_score) is the keeper; any
+    STRICTLY-smaller file sharing the keeper's aspect ratio is a pure downscale →
+    a loser.
+
+    Safety: a file is a loser ONLY when a larger sibling exists, so the unique /
+    largest copy of a shot is never staged ("a resized photo needs a bigger one
+    to exist before it can go").  Files without datetime_original are never
+    matched.  DB-only — no disk read; uses width/height/datetime already stored.
+    """
+    rows = db.conn.execute(
+        "SELECT file_id, filename, path, width, height, size_bytes, "
+        "camera_model, datetime_original FROM files "
+        "WHERE file_type IN ('CAMERA_JPEG','DEV_JPEG','HEIC') "
+        "AND datetime_original IS NOT NULL "
+        "AND width > 0 AND height > 0"
+    ).fetchall()
+
+    known = db.get_known_camera_models()
+    groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for r in rows:
+        stem = Path(r["filename"]).stem.strip().lower()
+        groups[(stem, r["datetime_original"])].append(r)
+
+    losers: set[int] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        keeper = max(members, key=lambda r: keep_score(r, known))
+        k_area = keeper["width"] * keeper["height"]
+        k_aspect = keeper["width"] / keeper["height"]
+        for m in members:
+            if m["file_id"] == keeper["file_id"]:
+                continue
+            if m["width"] * m["height"] >= k_area:
+                continue  # same-size sibling (tie) — left to exact dedup, not here
+            if abs(m["width"] / m["height"] - k_aspect) <= _RESIZE_ASPECT_TOL:
+                losers.add(m["file_id"])
+    return losers
+
+
 # ---------------------------------------------------------------------------
 # Target path builder
 # ---------------------------------------------------------------------------
@@ -630,6 +681,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         for row in batch:
             stage_ids.add(row["file_id"])
 
+    # Files staged because their CONTENT is preserved by a larger original (a
+    # different sha256), not by a byte-identical twin.  The 1d safety net (which
+    # guarantees each sha256 group keeps one copy) must EXEMPT these, or it would
+    # "rescue" a unique-sha resized copy and defeat the staging.
+    content_safe_stage: set[int] = set(stage_ids)  # RESIZED_JPEGs from 1a
+
     # 1b. Exact duplicate non-keepers
     # Heavily-mirrored libraries can have 100k+ exact groups, so this must stay
     # O(N): bulk-load metadata once and pick keepers in memory. We do NOT write
@@ -675,6 +732,16 @@ def plan(db: Database, target_root: Path, force: bool = False,
         near_dup_losers.add(loser)
         stage_ids.add(loser)
 
+    # 1c-bis. Resized / downscaled copies — a smaller version of a shot whose
+    # larger original survives (different sha256, so EXACT dedup never catches
+    # them).  keeper = largest; only strictly-smaller same-aspect siblings are
+    # staged, so the unique/biggest copy is always kept.  Content is preserved by
+    # the larger original, so these are content-safe (exempt from the 1d net).
+    with console.status("Finding resized / downscaled copies…"):
+        resize_copy_losers = resize_loser_ids(db)
+    stage_ids.update(resize_copy_losers)
+    content_safe_stage.update(resize_copy_losers)
+
     # 1d. Safety net — never stage EVERY byte-identical copy of a file.
     # EXACT and NEAR resolution choose keepers independently, so their staging
     # sets can overlap in a way that stages all copies of one sha256 group
@@ -689,8 +756,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         sha_groups[r["sha256"]].append(r["file_id"])
     rescued = 0
     for fids in sha_groups.values():
-        if all(f in stage_ids for f in fids):
-            keeper = _pick_keeper(db, fids, known_cameras)
+        # Only files whose survival matters BYTE-wise count here; a content-safe
+        # copy (resized/RESIZED) is preserved by a larger original elsewhere, so
+        # a group made entirely of those may be fully staged without rescue.
+        relevant = [f for f in fids if f not in content_safe_stage]
+        if relevant and all(f in stage_ids for f in relevant):
+            keeper = _pick_keeper(db, relevant, known_cameras)
             stage_ids.discard(keeper)
             near_dup_losers.discard(keeper)
             dup_non_keepers.discard(keeper)
@@ -834,6 +905,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         f"{resized_n:,}",
         "path contains 'resized'",
     )
+    if resize_copy_losers:
+        t.add_row(
+            "[red]Stage for deletion — Resized/downscaled copies[/red]",
+            f"{len(resize_copy_losers):,}",
+            "smaller copy of a shot; larger original kept",
+        )
     t.add_row(
         "[red]Stage for deletion — Exact duplicates[/red]",
         f"{len(dup_non_keepers):,}",
