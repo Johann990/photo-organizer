@@ -355,13 +355,11 @@ def _candidate_html(state: ReviewState, idx: int, fid: int,
 
 
 def _cluster_html(state: ReviewState, idx: int, members: list[int]) -> str:
-    scores: dict[int, float] = {}
-    for f in members:
-        try:
-            _, s = state.thumbs.ensure(f, state.meta[f]["path"])
-        except (OSError, ValueError):
-            s = 0.0
-        scores[f] = s
+    # Use only already-cached sharpness scores — don't decode originals here.
+    # Thumbnails are fetched lazily by the browser via <img src="/thumb/fid">;
+    # that endpoint calls ensure() and populates _sharp.  Blocking the GET /
+    # handler on thousands of image decodes makes the page appear blank.
+    scores: dict[int, float] = {f: state.thumbs._sharp.get(f, 0.0) for f in members}
 
     kept, _dropped = default_selection(members, state.meta, scores, state.known)
     soft = flag_soft_focus(scores)
