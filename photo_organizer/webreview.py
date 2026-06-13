@@ -241,6 +241,22 @@ def apply_decision(
     db.commit()
 
 
+def clear_decision(db: Database, members: list[int]) -> None:
+    """Revert a cluster's decision — reopen its NEAR pairs (the /undecision target).
+
+    Resets every intra-cluster NEAR pair back to 'pending' (keep_file_id NULL) so
+    a saved web decision can be undone and re-edited.  Idempotent; commits.
+    """
+    ids = ",".join("?" * len(members))
+    db.conn.execute(
+        f"UPDATE duplicates SET status='pending', keep_file_id=NULL, "
+        f"resolved_at=NULL WHERE dup_type='NEAR' "
+        f"AND file_id_a IN ({ids}) AND file_id_b IN ({ids})",
+        [*members, *members],
+    )
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Server state
 # ---------------------------------------------------------------------------
@@ -272,6 +288,7 @@ class ReviewState:
 # ---------------------------------------------------------------------------
 
 _MAX_POST_BYTES = 64 * 1024  # cluster decisions are tiny; cap to prevent memory DoS
+_MAX_BATCH_BYTES = 16 * 1024 * 1024  # /decision-all carries every cluster at once
 
 _PAGE_CSS = """
 :root { color-scheme: dark; }
@@ -281,6 +298,8 @@ h1 { font-size:1.25rem; margin:0 0 .2rem; }
 .sub { color:#8b93a1; font-size:.85rem; margin:0 0 1.4rem; }
 .cluster { border:1px solid #2b2f38; border-radius:10px; padding:.8rem .9rem;
            margin:0 0 1.1rem; background:#1c1f26; }
+.cluster.done { opacity:.55; }
+.cluster.done:hover { opacity:1; }
 .chead { display:flex; align-items:center; gap:.8rem; margin-bottom:.6rem;
          font-size:.9rem; color:#aab2c0; }
 .chead .tag { background:#2b2f38; border-radius:6px; padding:.1rem .5rem; }
@@ -303,12 +322,39 @@ h1 { font-size:1.25rem; margin:0 0 .2rem; }
                    font-size:.8rem; }
 .controls button:hover { background:#353b46; }
 .saved { color:#3fb950; font-size:.78rem; margin-left:.6rem; }
+.saved.dirty { color:#d29922; }
 .topbar { margin-bottom:1.2rem; font-size:.85rem; }
 .topbar a { color:#58a6ff; }
+.actionbar { position:sticky; top:0; z-index:10; background:#16181dee;
+             backdrop-filter:blur(4px); padding:.6rem 0 .7rem; margin:0 0 1rem;
+             border-bottom:1px solid #2b2f38; display:flex; align-items:center;
+             gap:.8rem; }
+.actionbar button.primary { background:#238636; color:#fff; border:1px solid #2ea043;
+             border-radius:6px; padding:.4rem 1rem; cursor:pointer; font-size:.85rem; }
+.actionbar button.primary:hover { background:#2ea043; }
+.allmsg { color:#8b93a1; font-size:.82rem; }
 """
 
 _PAGE_JS = """
-function post(idx){
+function setSaved(idx, saved){
+  const el=document.getElementById('c'+idx);
+  el.classList.toggle('done', saved);
+  el.dataset.saved = saved ? '1' : '';
+  const s=el.querySelector('.saved');
+  s.textContent = saved ? '✓ saved' : ''; s.className='saved';
+  el.querySelector('.savebtn').textContent = saved ? '↩ un-save' : 'save decision';
+}
+function setDirty(idx){
+  // Selection changed after a save — mark unsaved so the user re-saves.
+  const el=document.getElementById('c'+idx);
+  if(el.dataset.saved){
+    el.classList.remove('done'); el.dataset.saved='';
+    const s=el.querySelector('.saved');
+    s.textContent='● unsaved changes'; s.className='saved dirty';
+    el.querySelector('.savebtn').textContent='save decision';
+  }
+}
+function save(idx){
   const el = document.getElementById('c'+idx);
   const kept=[], dropped=[];
   el.querySelectorAll('.cand').forEach(c=>{
@@ -317,18 +363,49 @@ function post(idx){
   });
   fetch('/decision',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({cluster:idx,kept:kept,dropped:dropped})})
-   .then(r=>{ if(r.ok){ el.querySelector('.saved').textContent='✓ saved';
-                        el.style.opacity=.5; } });
+   .then(r=>{ if(r.ok){ setSaved(idx,true); } });
+}
+function undo(idx){
+  fetch('/undecision',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cluster:idx})})
+   .then(r=>{ if(r.ok){ setSaved(idx,false); } });
+}
+function saveOrUndo(idx){
+  const el=document.getElementById('c'+idx);
+  if(el.dataset.saved){ undo(idx); } else { save(idx); }
 }
 function toggle(idx,id){
   const el=document.getElementById('c'+idx);
   const c=el.querySelector('.cand[data-id="'+id+'"]');
   if(c.classList.contains('keep')){ c.classList.remove('keep'); c.classList.add('drop'); }
   else { c.classList.remove('drop'); c.classList.add('keep'); }
+  setDirty(idx);
 }
 function keepAll(idx){
   document.querySelectorAll('#c'+idx+' .cand').forEach(c=>{
     c.classList.remove('drop'); c.classList.add('keep'); });
+  setDirty(idx);
+}
+function selOf(el){
+  const kept=[], dropped=[];
+  el.querySelectorAll('.cand').forEach(c=>{
+    const id=parseInt(c.dataset.id,10);
+    (c.classList.contains('drop')?dropped:kept).push(id);
+  });
+  return {cluster:parseInt(el.dataset.idx,10), kept:kept, dropped:dropped};
+}
+function saveAll(){
+  const cls=document.querySelectorAll('.cluster');
+  const decisions=[]; cls.forEach(el=>decisions.push(selOf(el)));
+  const msg=document.getElementById('allmsg');
+  msg.textContent='saving '+decisions.length+' cluster(s)…';
+  fetch('/decision-all',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({decisions:decisions})})
+   .then(r=>r.json()).then(j=>{
+     if(j.ok){ cls.forEach(el=>setSaved(parseInt(el.dataset.idx,10),true));
+               msg.textContent='✓ saved all '+j.saved+' cluster(s)'; }
+     else { msg.textContent='error: '+(j.error||'failed'); }
+   }).catch(()=>{ msg.textContent='error saving'; });
 }
 """
 
@@ -371,14 +448,14 @@ def _cluster_html(state: ReviewState, idx: int, members: list[int]) -> str:
     )
     ham = state.hamming(members)
     return (
-        f'<div class="cluster" id="c{idx}">'
+        f'<div class="cluster" id="c{idx}" data-idx="{idx}">'
         f'<div class="chead"><span class="tag">#{idx + 1}</span>'
         f'<span>{len(members)} candidates</span>'
         f'<span class="tag">Hamming≈{ham}</span></div>'
         f'<div class="grid">{cands}</div>'
         f'<div class="controls">'
         f'<button onclick="keepAll({idx})">keep all</button> '
-        f'<button onclick="post({idx})">save decision</button>'
+        f'<button class="savebtn" onclick="saveOrUndo({idx})">save decision</button>'
         f'<span class="saved"></span></div></div>'
     )
 
@@ -391,6 +468,12 @@ def _render_page(state: ReviewState) -> bytes:
         body = "".join(
             _cluster_html(state, i, m) for i, m in enumerate(state.clusters)
         )
+    actionbar = (
+        '<div class="actionbar">'
+        f'<button class="primary" onclick="saveAll()">Save all {total} decisions</button>'
+        '<span id="allmsg" class="allmsg"></span></div>'
+        if total else ""
+    )
     doc = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -400,7 +483,7 @@ def _render_page(state: ReviewState) -> bytes:
         f'<p class="sub">{total} cluster(s). Green = keep, dim = drop. '
         "Click a thumbnail to toggle, then “save decision”. "
         "Nothing is deleted here — <b>plan</b> stages the drops you confirm.</p>"
-        f"{body}"
+        f"{actionbar}{body}"
         f"<script>{_PAGE_JS}</script></body></html>"
     )
     return doc.encode("utf-8")
@@ -436,8 +519,17 @@ def _make_handler(state: ReviewState):
                 return
             self._send(404, b"not found", "text/plain")
 
+        def _decisions(self, payload):
+            """Validate and yield (members, kept, dropped) per decision dict."""
+            for d in payload.get("decisions", []):
+                members = state.clusters[int(d["cluster"])]
+                mset = set(members)
+                kept = {int(f) for f in d.get("kept", [])} & mset
+                dropped = {int(f) for f in d.get("dropped", [])} & mset
+                yield members, kept, dropped
+
         def do_POST(self):
-            if self.path != "/decision":
+            if self.path not in ("/decision", "/undecision", "/decision-all"):
                 self._send(404, b"not found", "text/plain")
                 return
             host = self.headers.get("Host", "").split(":")[0]
@@ -445,13 +537,31 @@ def _make_handler(state: ReviewState):
                 self._send(403, b"forbidden", "text/plain")
                 return
             try:
-                length = min(
-                    int(self.headers.get("Content-Length", 0)),
-                    _MAX_POST_BYTES,
-                )
+                cap = (_MAX_BATCH_BYTES if self.path == "/decision-all"
+                       else _MAX_POST_BYTES)
+                length = min(int(self.headers.get("Content-Length", 0)), cap)
                 payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/decision-all":
+                    # Save every cluster's current selection in one transaction.
+                    saved = 0
+                    with state.lock:
+                        for members, kept, dropped in self._decisions(payload):
+                            record_selection(state.db, members, kept, dropped,
+                                              state.hamming(members),
+                                              meta=state.meta, known=state.known)
+                            saved += 1
+                        state.db.commit()
+                    self._send(200, json.dumps({"ok": True, "saved": saved}).encode(),
+                               "application/json")
+                    return
                 idx = int(payload["cluster"])
                 members = state.clusters[idx]
+                if self.path == "/undecision":
+                    # Reopen the cluster — revert a previously saved decision.
+                    with state.lock:
+                        clear_decision(state.db, members)
+                    self._send(200, b'{"ok":true}', "application/json")
+                    return
                 member_set = set(members)
                 # Reject any file_id that is not a member of this cluster.
                 kept = {int(f) for f in payload.get("kept", [])} & member_set
