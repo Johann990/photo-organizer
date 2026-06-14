@@ -431,29 +431,65 @@ _RESIZE_ASPECT_TOL = 0.02
 # content-equality decision.  Shared with reviewer's near-cluster junk filter.
 JUNK_PHASH_MIN_FILES = 8
 
+# Folder-name tokens that mark a throwaway export / derivative copy.  A path
+# component is a "derivative folder" when, split on non-alphanumerics, any of its
+# tokens is in this set (so "resize+crop" matches via {resize, crop}).  "jpeg" is
+# intentionally absent — in this library a "Jpeg" folder holds developed masters.
+# Downscaled+cropped derivatives are unreliable for pHash/date matching (different
+# shots can collide once shrunk), so the FOLDER is the trustworthy signal here.
+_DERIVATIVE_FOLDER_TOKENS = frozenset({
+    "resize", "resized", "crop", "cropped", "share", "shared", "export",
+    "exports", "web", "websize", "small", "thumb", "thumbs", "thumbnail",
+    "thumbnails", "preview", "previews", "proof", "proofs",
+})
+
+_FOLDER_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _is_derivative_folder(name: str) -> bool:
+    return bool(set(_FOLDER_TOKEN_SPLIT.split(name.lower())) & _DERIVATIVE_FOLDER_TOKENS)
+
+
+def _derivative_event_root(path: Path) -> str | None:
+    """Lowercased ancestor dir just ABOVE the first derivative folder, or None.
+
+    For `…/EVENT/share/IMG.jpg` returns `…/event`; a same-stem master kept under
+    EVENT (e.g. `EVENT/Jpeg/IMG.JPG` or `EVENT/IMG.CR2`) lives under this root.
+    """
+    parts = path.parts
+    for i in range(len(parts) - 1):  # directory components only (skip filename)
+        if _is_derivative_folder(parts[i]):
+            return str(Path(*parts[:i])).lower()
+    return None
+
 
 def redundant_copy_ids(db: Database) -> set[int]:
     """file_ids that are redundant copies of a shot whose better version survives.
 
-    Two complementary, independently-safe signals.  A copy is staged ONLY when a
-    superior sibling is KEPT, so the unique / best version of any content is never
-    touched.  RAW and VIDEO are out of scope (only CAMERA_JPEG/DEV_JPEG/HEIC), so
-    RAW masters are always kept.  DB-only — no disk read.
+    Copies of one shot are linked into a connected component, then the keep_score
+    best of each component is KEPT and every other member is staged.  Two edges
+    link "the same shot", both independently safe:
 
-    Rule A — re-encodes & renamed exports:
-        Files sharing an EXIF datetime_original AND an identical, non-junk pHash
-        are the same shot content (same capture second + same perceptual hash).
-        Keep the keep_score best; every other copy is redundant — a same-size
-        re-encode (different sha, so EXACT dedup misses it) or a downscale whose
-        pHash survived, EVEN IF the filename was changed (e.g. image00017.jpg).
+      • same (filename stem + EXIF datetime_original) AND matching aspect ratio —
+        the same camera frame re-saved/downscaled (any size, even a tiny thumbnail
+        whose pHash drifted).  Different aspect (a CROP or rotation) is NOT linked,
+        so deliberately cropped versions are kept.
+      • same (datetime_original + identical non-junk pHash) — the same image even
+        if the file was RENAMED (e.g. an export named image00017.jpg).
 
-    Rule B — downscales whose pHash drifted:
-        Within a (stem, datetime_original) group, a STRICTLY-smaller file sharing
-        the keeper's aspect ratio is a pure downscale.  Catches heavy resizes that
-        Rule A misses because the pHash moved too far (filename preserved).
+    Plus a folder rule: a JPEG inside a derivative-export folder (share/resize/
+    crop/…) is staged when a same-stem master exists in the same event.  Such
+    downscaled+cropped exports defeat pHash (different shots collide once shrunk)
+    and often have their EXIF date stripped, so the folder name is the reliable
+    signal; the master (and RAW) elsewhere is what preserves the content.
 
-    A Rule A keeper is the best copy of a distinct pHash content and is never
-    staged, so Rule B can't delete content that has no larger same-content copy.
+    Because grouping is by shot — not by which copy is "best" — there is no
+    keeper-vs-keeper conflict: each component keeps exactly one survivor, so a
+    tiny thumbnail is always staged when a larger sibling exists.  A unique shot
+    (singleton component) is never staged.  RAW/VIDEO are out of scope (only
+    CAMERA_JPEG/DEV_JPEG/HEIC), so RAW masters are always kept.  Genuine bursts
+    (consecutive frames: different filenames AND different pHash) are NOT linked,
+    so they remain for near-duplicate review.  DB-only — no disk read.
     """
     rows = db.conn.execute(
         "SELECT file_id, filename, path, width, height, size_bytes, "
@@ -473,43 +509,80 @@ def redundant_copy_ids(db: Database) -> set[int]:
         )
     }
 
-    losers: set[int] = set()
-    protected: set[int] = set()  # Rule A keepers — best copy of a content, never staged
+    meta = {r["file_id"]: r for r in rows}
+    parent: dict[int, int] = {r["file_id"]: r["file_id"] for r in rows}
 
-    # ── Rule A: datetime + identical (non-junk) pHash → same shot content ──
-    by_content: dict[tuple[str, str], list[Any]] = defaultdict(list)
-    for r in rows:
-        if r["phash"] and r["phash"] not in junk:
-            by_content[(r["datetime_original"], r["phash"])].append(r)
-    for members in by_content.values():
-        if len(members) < 2:
-            continue
-        keeper = max(members, key=lambda r: keep_score(r, known))
-        protected.add(keeper["file_id"])
-        for m in members:
-            if m["file_id"] != keeper["file_id"]:
-                losers.add(m["file_id"])
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    # ── Rule B: stem + datetime, strictly-smaller same-aspect downscale ──
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Edge 1 — same (stem, datetime), pairwise within matching aspect ratio.
     by_shot: dict[tuple[str, str], list[Any]] = defaultdict(list)
     for r in rows:
         stem = Path(r["filename"]).stem.strip().lower()
         by_shot[(stem, r["datetime_original"])].append(r)
     for members in by_shot.values():
+        for i in range(len(members)):
+            ai = members[i]["width"] / members[i]["height"]
+            for j in range(i + 1, len(members)):
+                aj = members[j]["width"] / members[j]["height"]
+                if abs(ai - aj) <= _RESIZE_ASPECT_TOL:
+                    union(members[i]["file_id"], members[j]["file_id"])
+
+    # Edge 2 — same (datetime, identical non-junk pHash): renamed/re-encoded copy.
+    by_content: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for r in rows:
+        if r["phash"] and r["phash"] not in junk:
+            by_content[(r["datetime_original"], r["phash"])].append(r["file_id"])
+    for ids in by_content.values():
+        for fid in ids[1:]:
+            union(ids[0], fid)
+
+    components: dict[int, list[int]] = defaultdict(list)
+    for fid in parent:
+        components[find(fid)].append(fid)
+
+    losers: set[int] = set()
+    for members in components.values():
         if len(members) < 2:
             continue
-        keeper = max(members, key=lambda r: keep_score(r, known))
-        k_area = keeper["width"] * keeper["height"]
-        k_aspect = keeper["width"] / keeper["height"]
-        for m in members:
-            if m["file_id"] == keeper["file_id"]:
-                continue
-            if m["width"] * m["height"] >= k_area:
-                continue  # same-size sibling — handled by Rule A / exact dedup
-            if abs(m["width"] / m["height"] - k_aspect) <= _RESIZE_ASPECT_TOL:
-                losers.add(m["file_id"])
+        keeper = max(members, key=lambda f: keep_score(meta[f], known))
+        losers.update(f for f in members if f != keeper)
 
-    return losers - protected
+    # Folder rule — derivative-export copies with a same-stem master in-event.
+    # Index every NON-derivative file's parent dir by stem (RAW counts as a
+    # master), then stage any derivative-folder JPEG whose event root contains a
+    # same-stem master.  Independent of pHash/date, so it catches stripped-date,
+    # cropped, and cross-shot-colliding exports the edges above can't place.
+    masters_by_stem: dict[str, list[str]] = defaultdict(list)
+    for r in db.conn.execute("SELECT filename, path FROM files"):
+        p = Path(r["path"])
+        if _derivative_event_root(p) is None:  # a master lives outside such folders
+            stem = Path(r["filename"]).stem.strip().lower()
+            masters_by_stem[stem].append(str(p.parent).lower())
+    # Candidate query is separate from `rows`: derivative exports often have their
+    # EXIF date stripped (so they fail the datetime filter), but the folder rule
+    # doesn't need a date.
+    for r in db.conn.execute(
+        "SELECT file_id, filename, path FROM files "
+        "WHERE file_type IN ('CAMERA_JPEG','DEV_JPEG','HEIC') "
+        "AND width > 0 AND height > 0"
+    ):
+        root = _derivative_event_root(Path(r["path"]))
+        if root is None:
+            continue
+        stem = Path(r["filename"]).stem.strip().lower()
+        if any(d.startswith(root) for d in masters_by_stem.get(stem, ())):
+            losers.add(r["file_id"])
+
+    return losers
 
 
 # ---------------------------------------------------------------------------

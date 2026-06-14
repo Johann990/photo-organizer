@@ -115,6 +115,72 @@ def test_same_size_reencodes_collapse(tmp_path):
         assert redundant_copy_ids(db) == {2, 3}
 
 
+def test_drifted_thumbnail_staged_via_stem_aspect(tmp_path):
+    """Regression: a tiny thumbnail whose pHash drifted must still be staged.
+
+    The thumbnail (144x95) has a different pHash from the original (too small for
+    a stable hash) but shares its filename, capture time and aspect ratio.  An
+    earlier 'protected Rule-A keeper' guard wrongly rescued such thumbnails when
+    two of them shared a pHash; stem+aspect linking must stage it regardless.
+    """
+    with Database(tmp_path / "p.db") as db:
+        _add(db, 1, "DSC_0169.jpg", w=3008, h=2000, dt="2006:08:19 15:42:25",
+             sha="a", phash="8013d71c730f9dd3")  # original
+        _add(db, 2, "DSC_0169.jpg", w=144, h=95, dt="2006:08:19 15:42:25",
+             sha="b", phash="8013d71c734f95d3", path="/t/DSC_0169.jpg")  # thumb, drifted
+        _add(db, 3, "DSC_0169.jpg", w=144, h=95, dt="2006:08:19 15:42:25",
+             sha="c", phash="8013d71c734f95d3", path="/u/DSC_0169.jpg")  # thumb twin
+        db.commit()
+        # 144/95=1.5158 vs 3008/2000=1.504 → within aspect tol → all one shot.
+        assert redundant_copy_ids(db) == {2, 3}
+
+
+def test_crop_same_name_and_time_is_kept(tmp_path):
+    """A different-aspect derivative (crop) of the same filename/second is kept."""
+    with Database(tmp_path / "p.db") as db:
+        _add(db, 1, "IMG_1.jpg", w=5616, h=3744, dt="2010:02:15 20:11:08",
+             sha="a", phash="d2dee0369b306d98")          # 3:2 original
+        _add(db, 2, "IMG_1.jpg", w=2048, h=1536, dt="2010:02:15 20:11:08",
+             sha="b", phash="aaaaaaaaaaaaaaaa", path="/b/IMG_1.jpg")  # 4:3 crop
+        db.commit()
+        assert redundant_copy_ids(db) == set()
+
+
+def test_derivative_folder_export_staged(tmp_path):
+    """A cropped/stripped-date export in a share/resize folder is staged when a
+    same-stem master exists in the same event — even when pHash/date can't place
+    it (downscaled crops of different shots collide; share copies lose EXIF date).
+    """
+    with Database(tmp_path / "p.db") as db:
+        ev = "/photos/2012/Event"
+        # Masters: full JPEG + RAW under the event (not in a derivative folder).
+        _add(db, 1, "IMG_9717.JPG", w=5616, h=3744, dt="2012:05:20 15:47:03",
+             sha="a", phash="cb959607c069f3e1", path=f"{ev}/Jpeg/IMG_9717.JPG")
+        db.conn.execute(
+            "INSERT INTO files (file_id, path, filename, extension, file_type, "
+            "status, width, height) VALUES (?,?,?,?,?,?,?,?)",
+            (2, f"{ev}/IMG_9717.CR2", "IMG_9717.CR2", "cr2", "RAW", "scanned",
+             5616, 3744),
+        )
+        # Derivatives: cropped (4:3, different aspect) and date-stripped share copy.
+        _add(db, 3, "IMG_9717.jpg", w=2048, h=1536, dt="2012:05:20 15:47:03",
+             sha="b", phash="da9d9406ca69b3e1", path=f"{ev}/resize+crop/IMG_9717.jpg")
+        _add(db, 4, "IMG_9717.jpg", w=2048, h=1536, dt=None,
+             sha="c", phash="da9d9406ca7933e1", path=f"{ev}/share/IMG_9717.jpg")
+        db.commit()
+        # Both derivatives staged; the full JPEG master (1) and RAW (2) are kept.
+        assert redundant_copy_ids(db) == {3, 4}
+
+
+def test_derivative_folder_without_master_kept(tmp_path):
+    """An export with NO same-stem master must be kept (could be the only copy)."""
+    with Database(tmp_path / "p.db") as db:
+        _add(db, 1, "only.jpg", w=2048, h=1536, dt=None,
+             phash="abc1230000000000", path="/photos/Event/share/only.jpg")
+        db.commit()
+        assert redundant_copy_ids(db) == set()
+
+
 def test_renamed_resize_caught_by_phash(tmp_path):
     """A downscaled export with a DIFFERENT filename but identical pHash."""
     with Database(tmp_path / "p.db") as db:
