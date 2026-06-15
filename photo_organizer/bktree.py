@@ -20,7 +20,7 @@ from typing import Callable
 
 def hamming_distance(a: int, b: int) -> int:
     """Number of differing bits between two integers."""
-    return bin(a ^ b).count("1")
+    return (a ^ b).bit_count()  # native popcount — Python 3.10+
 
 
 class _Node:

@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from photo_organizer.db import Database
 from photo_organizer.webreview import (
+    ReviewState,
     ThumbCache,
     apply_decision,
     default_selection,
@@ -260,7 +261,8 @@ def test_serve_decision_endpoint_round_trip(tmp_path):
     with Database(db_path) as db:
         _add_file(db, 1, "/a/IMG_001.jpg", "IMG_001.jpg", w=4000, h=3000)
         _add_file(db, 2, "/b/IMG_001.jpg", "IMG_001.jpg", w=800, h=600)
-        _add_near_pair(db, 1, 2, hamming=5)
+        # hamming must be within _CLUSTER_HAMMING so the pair forms a cluster.
+        _add_near_pair(db, 1, 2, hamming=2)
         db.commit()
 
         server = serve(db, review_all=True, port=0, open_browser=False,
@@ -285,3 +287,94 @@ def test_serve_decision_endpoint_round_trip(tmp_path):
         ).fetchone()
         assert row["status"] == "reviewed"
         assert row["keep_file_id"] == 1
+
+
+def test_serve_undecision_reopens_cluster(tmp_path):
+    """POST /undecision reverts a saved decision back to pending (un-save)."""
+    db_path = tmp_path / "photos.db"
+    with Database(db_path) as db:
+        _add_file(db, 1, "/a/IMG_001.jpg", "IMG_001.jpg", w=4000, h=3000)
+        _add_file(db, 2, "/b/IMG_001.jpg", "IMG_001.jpg", w=800, h=600)
+        _add_near_pair(db, 1, 2, hamming=2)
+        db.commit()
+
+        server = serve(db, review_all=True, port=0, open_browser=False,
+                       background=True)
+        try:
+            host, port = server.server_address
+
+            def post(path, payload):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                return urllib.request.urlopen(req, timeout=5).status
+
+            assert post("/decision", {"cluster": 0, "kept": [1], "dropped": [2]}) == 200
+            row = db.conn.execute(
+                "SELECT status FROM duplicates WHERE file_id_a=1 AND file_id_b=2"
+            ).fetchone()
+            assert row["status"] == "reviewed"
+
+            # Un-save: the pair returns to pending and keep_file_id clears.
+            assert post("/undecision", {"cluster": 0}) == 200
+            row = db.conn.execute(
+                "SELECT status, keep_file_id, resolved_at FROM duplicates "
+                "WHERE file_id_a=1 AND file_id_b=2"
+            ).fetchone()
+            assert row["status"] == "pending"
+            assert row["keep_file_id"] is None
+            assert row["resolved_at"] is None
+        finally:
+            server.shutdown()
+
+
+def test_serve_decision_all_saves_every_cluster(tmp_path):
+    """POST /decision-all records every cluster's selection in one request."""
+    db_path = tmp_path / "photos.db"
+    with Database(db_path) as db:
+        # Two independent same-name clusters: {1,2} and {3,4}.
+        _add_file(db, 1, "/a/IMG_1.jpg", "IMG_1.jpg", w=4000, h=3000)
+        _add_file(db, 2, "/b/IMG_1.jpg", "IMG_1.jpg", w=800, h=600)
+        _add_file(db, 3, "/a/IMG_2.jpg", "IMG_2.jpg", w=4000, h=3000)
+        _add_file(db, 4, "/b/IMG_2.jpg", "IMG_2.jpg", w=800, h=600)
+        _add_near_pair(db, 1, 2, hamming=2)
+        _add_near_pair(db, 3, 4, hamming=2)
+        db.commit()
+
+        # Mirror the server's cluster ordering to address them by index.
+        state = ReviewState(db, review_all=True, cache_dir=tmp_path / ".thumbs")
+        decisions = []
+        for idx, members in enumerate(state.clusters):
+            keeper = max(members)  # the 4000px copy has the higher file_id here
+            decisions.append({
+                "cluster": idx,
+                "kept": [keeper],
+                "dropped": [m for m in members if m != keeper],
+            })
+        assert len(decisions) == 2
+
+        server = serve(db, review_all=True, port=0, open_browser=False,
+                       background=True)
+        try:
+            host, port = server.server_address
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/decision-all",
+                data=json.dumps({"decisions": decisions}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=5)
+            assert resp.status == 200
+        finally:
+            server.shutdown()
+
+        # Both clusters' pairs are now reviewed; nothing left pending.
+        reviewed = db.conn.execute(
+            "SELECT COUNT(*) FROM duplicates WHERE status='reviewed'"
+        ).fetchone()[0]
+        pending = db.conn.execute(
+            "SELECT COUNT(*) FROM duplicates WHERE status='pending'"
+        ).fetchone()[0]
+        assert reviewed == 2
+        assert pending == 0

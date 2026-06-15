@@ -422,6 +422,169 @@ def _pick_keeper(db: Database, group: list[int], known_cameras: set[str]) -> int
     return max(rows, key=lambda r: keep_score(r, known_cameras))["file_id"]
 
 
+# Aspect-ratio equality tolerance — a pure downscale preserves the ratio; a crop
+# or rotation changes it, so those are NOT treated as resize copies.
+_RESIZE_ASPECT_TOL = 0.02
+
+# A pHash shared by this many files is non-discriminative (low-information image:
+# dark/flat) and collides across unrelated photos, so it must never drive a
+# content-equality decision.  Shared with reviewer's near-cluster junk filter.
+JUNK_PHASH_MIN_FILES = 8
+
+# Folder-name tokens that mark a throwaway export / derivative copy.  A path
+# component is a "derivative folder" when, split on non-alphanumerics, any of its
+# tokens is in this set (so "resize+crop" matches via {resize, crop}).  "jpeg" is
+# intentionally absent — in this library a "Jpeg" folder holds developed masters.
+# Downscaled+cropped derivatives are unreliable for pHash/date matching (different
+# shots can collide once shrunk), so the FOLDER is the trustworthy signal here.
+_DERIVATIVE_FOLDER_TOKENS = frozenset({
+    "resize", "resized", "crop", "cropped", "share", "shared", "export",
+    "exports", "web", "websize", "small", "thumb", "thumbs", "thumbnail",
+    "thumbnails", "preview", "previews", "proof", "proofs",
+})
+
+_FOLDER_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _is_derivative_folder(name: str) -> bool:
+    return bool(set(_FOLDER_TOKEN_SPLIT.split(name.lower())) & _DERIVATIVE_FOLDER_TOKENS)
+
+
+def _derivative_event_root(path: Path) -> str | None:
+    """Lowercased ancestor dir just ABOVE the first derivative folder, or None.
+
+    For `…/EVENT/share/IMG.jpg` returns `…/event`; a same-stem master kept under
+    EVENT (e.g. `EVENT/Jpeg/IMG.JPG` or `EVENT/IMG.CR2`) lives under this root.
+    """
+    parts = path.parts
+    for i in range(len(parts) - 1):  # directory components only (skip filename)
+        if _is_derivative_folder(parts[i]):
+            return str(Path(*parts[:i])).lower()
+    return None
+
+
+def redundant_copy_ids(db: Database) -> set[int]:
+    """file_ids that are redundant copies of a shot whose better version survives.
+
+    Copies of one shot are linked into a connected component, then the keep_score
+    best of each component is KEPT and every other member is staged.  Two edges
+    link "the same shot", both independently safe:
+
+      • same (filename stem + EXIF datetime_original) AND matching aspect ratio —
+        the same camera frame re-saved/downscaled (any size, even a tiny thumbnail
+        whose pHash drifted).  Different aspect (a CROP or rotation) is NOT linked,
+        so deliberately cropped versions are kept.
+      • same (datetime_original + identical non-junk pHash) — the same image even
+        if the file was RENAMED (e.g. an export named image00017.jpg).
+
+    Plus a folder rule: a JPEG inside a derivative-export folder (share/resize/
+    crop/…) is staged when a same-stem master exists in the same event.  Such
+    downscaled+cropped exports defeat pHash (different shots collide once shrunk)
+    and often have their EXIF date stripped, so the folder name is the reliable
+    signal; the master (and RAW) elsewhere is what preserves the content.
+
+    Because grouping is by shot — not by which copy is "best" — there is no
+    keeper-vs-keeper conflict: each component keeps exactly one survivor, so a
+    tiny thumbnail is always staged when a larger sibling exists.  A unique shot
+    (singleton component) is never staged.  RAW/VIDEO are out of scope (only
+    CAMERA_JPEG/DEV_JPEG/HEIC), so RAW masters are always kept.  Genuine bursts
+    (consecutive frames: different filenames AND different pHash) are NOT linked,
+    so they remain for near-duplicate review.  DB-only — no disk read.
+    """
+    rows = db.conn.execute(
+        "SELECT file_id, filename, path, width, height, size_bytes, "
+        "camera_model, datetime_original, phash FROM files "
+        "WHERE file_type IN ('CAMERA_JPEG','DEV_JPEG','HEIC') "
+        "AND datetime_original IS NOT NULL "
+        "AND width > 0 AND height > 0"
+    ).fetchall()
+
+    known = db.get_known_camera_models()
+    junk = {
+        r[0]
+        for r in db.conn.execute(
+            "SELECT phash FROM files WHERE phash IS NOT NULL "
+            "GROUP BY phash HAVING COUNT(*) >= ?",
+            (JUNK_PHASH_MIN_FILES,),
+        )
+    }
+
+    meta = {r["file_id"]: r for r in rows}
+    parent: dict[int, int] = {r["file_id"]: r["file_id"] for r in rows}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Edge 1 — same (stem, datetime), pairwise within matching aspect ratio.
+    by_shot: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for r in rows:
+        stem = Path(r["filename"]).stem.strip().lower()
+        by_shot[(stem, r["datetime_original"])].append(r)
+    for members in by_shot.values():
+        for i in range(len(members)):
+            ai = members[i]["width"] / members[i]["height"]
+            for j in range(i + 1, len(members)):
+                aj = members[j]["width"] / members[j]["height"]
+                if abs(ai - aj) <= _RESIZE_ASPECT_TOL:
+                    union(members[i]["file_id"], members[j]["file_id"])
+
+    # Edge 2 — same (datetime, identical non-junk pHash): renamed/re-encoded copy.
+    by_content: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for r in rows:
+        if r["phash"] and r["phash"] not in junk:
+            by_content[(r["datetime_original"], r["phash"])].append(r["file_id"])
+    for ids in by_content.values():
+        for fid in ids[1:]:
+            union(ids[0], fid)
+
+    components: dict[int, list[int]] = defaultdict(list)
+    for fid in parent:
+        components[find(fid)].append(fid)
+
+    losers: set[int] = set()
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        keeper = max(members, key=lambda f: keep_score(meta[f], known))
+        losers.update(f for f in members if f != keeper)
+
+    # Folder rule — derivative-export copies with a same-stem master in-event.
+    # Index every NON-derivative file's parent dir by stem (RAW counts as a
+    # master), then stage any derivative-folder JPEG whose event root contains a
+    # same-stem master.  Independent of pHash/date, so it catches stripped-date,
+    # cropped, and cross-shot-colliding exports the edges above can't place.
+    masters_by_stem: dict[str, list[str]] = defaultdict(list)
+    for r in db.conn.execute("SELECT filename, path FROM files"):
+        p = Path(r["path"])
+        if _derivative_event_root(p) is None:  # a master lives outside such folders
+            stem = Path(r["filename"]).stem.strip().lower()
+            masters_by_stem[stem].append(str(p.parent).lower())
+    # Candidate query is separate from `rows`: derivative exports often have their
+    # EXIF date stripped (so they fail the datetime filter), but the folder rule
+    # doesn't need a date.
+    for r in db.conn.execute(
+        "SELECT file_id, filename, path FROM files "
+        "WHERE file_type IN ('CAMERA_JPEG','DEV_JPEG','HEIC') "
+        "AND width > 0 AND height > 0"
+    ):
+        root = _derivative_event_root(Path(r["path"]))
+        if root is None:
+            continue
+        stem = Path(r["filename"]).stem.strip().lower()
+        if any(d.startswith(root) for d in masters_by_stem.get(stem, ())):
+            losers.add(r["file_id"])
+
+    return losers
+
+
 # ---------------------------------------------------------------------------
 # Target path builder
 # ---------------------------------------------------------------------------
@@ -630,6 +793,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         for row in batch:
             stage_ids.add(row["file_id"])
 
+    # Files staged because their CONTENT is preserved by a larger original (a
+    # different sha256), not by a byte-identical twin.  The 1d safety net (which
+    # guarantees each sha256 group keeps one copy) must EXEMPT these, or it would
+    # "rescue" a unique-sha resized copy and defeat the staging.
+    content_safe_stage: set[int] = set(stage_ids)  # RESIZED_JPEGs from 1a
+
     # 1b. Exact duplicate non-keepers
     # Heavily-mirrored libraries can have 100k+ exact groups, so this must stay
     # O(N): bulk-load metadata once and pick keepers in memory. We do NOT write
@@ -675,6 +844,15 @@ def plan(db: Database, target_root: Path, force: bool = False,
         near_dup_losers.add(loser)
         stage_ids.add(loser)
 
+    # 1c-bis. Redundant copies — re-encodes and downscales of a shot whose better
+    # version survives (different sha256, so EXACT dedup never catches them).
+    # keeper = best/largest; the redundant copies' content is preserved by that
+    # survivor, so they are content-safe (exempt from the 1d byte-survival net).
+    with console.status("Finding redundant copies (re-encodes + resizes)…"):
+        redundant_copy_losers = redundant_copy_ids(db)
+    stage_ids.update(redundant_copy_losers)
+    content_safe_stage.update(redundant_copy_losers)
+
     # 1d. Safety net — never stage EVERY byte-identical copy of a file.
     # EXACT and NEAR resolution choose keepers independently, so their staging
     # sets can overlap in a way that stages all copies of one sha256 group
@@ -689,8 +867,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         sha_groups[r["sha256"]].append(r["file_id"])
     rescued = 0
     for fids in sha_groups.values():
-        if all(f in stage_ids for f in fids):
-            keeper = _pick_keeper(db, fids, known_cameras)
+        # Only files whose survival matters BYTE-wise count here; a content-safe
+        # copy (resized/RESIZED) is preserved by a larger original elsewhere, so
+        # a group made entirely of those may be fully staged without rescue.
+        relevant = [f for f in fids if f not in content_safe_stage]
+        if relevant and all(f in stage_ids for f in relevant):
+            keeper = _pick_keeper(db, relevant, known_cameras)
             stage_ids.discard(keeper)
             near_dup_losers.discard(keeper)
             dup_non_keepers.discard(keeper)
@@ -834,6 +1016,12 @@ def plan(db: Database, target_root: Path, force: bool = False,
         f"{resized_n:,}",
         "path contains 'resized'",
     )
+    if redundant_copy_losers:
+        t.add_row(
+            "[red]Stage for deletion — Redundant copies (re-encodes + resizes)[/red]",
+            f"{len(redundant_copy_losers):,}",
+            "same shot, lower quality; best copy kept",
+        )
     t.add_row(
         "[red]Stage for deletion — Exact duplicates[/red]",
         f"{len(dup_non_keepers):,}",
