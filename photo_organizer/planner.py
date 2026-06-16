@@ -337,6 +337,12 @@ _CONTAINER_NAMES: frozenset[str] = frozenset({
     "develop", "develops", "developed", "export", "exports", "share",
     # software/junk dirs seen in the wild (MS Office sample images, etc.)
     "station", "office11",
+    # generic placeholder/scratch words — EXACT-match only (not a substring
+    # rule), so a real name that merely contains one of these (Old_Believers_
+    # Trip, backup_plan_for_japan) is unaffected; only a folder whose whole
+    # normalised name equals one of these is a container.
+    "old", "new", "misc", "backup", "bak", "copy", "untitled",
+    "新增資料夾", "未命名", "暫存",
 })
 
 # Substrings / patterns marking a device dump, scratch area, or burn batch.
@@ -366,7 +372,14 @@ def _is_container_or_device(name: str | None) -> bool:
     return any(p.search(norm) for p in _CONTAINER_PATTERNS)
 
 
-def _resolve_event_folder(path: Path) -> Path | None:
+def _norm_path(p: Path | str) -> str:
+    """Separator/case-normalised path string for boundary comparison (no I/O)."""
+    return str(Path(p)).replace("/", "\\").rstrip("\\").lower()
+
+
+def _resolve_event_folder(
+    path: Path, scan_roots: list[Path] | None = None
+) -> Path | None:
     """Climb from a file's parent folder up to the nearest ancestor that carries
     a real event/subject label, returning that folder (or None if none exists).
 
@@ -379,17 +392,26 @@ def _resolve_event_folder(path: Path) -> Path | None:
     Returns the FIRST (lowest) qualifying ancestor, so a real event folder is
     never overshot into its storage parent (…/Albums/2013/墾丁凱撒/JPG/x.jpg
     resolves to 墾丁凱撒, not Albums).
+
+    ``scan_roots`` bounds the climb: it never goes ABOVE a scan-input root. The
+    root itself may be the event (you scanned an event folder directly), but once
+    the only names up to the root are containers/dumps the file has no event →
+    None (a no-event date folder), instead of mislabelling a top-level storage
+    folder above the root as a subject. Default (None) = unbounded.
     """
+    roots = {_norm_path(r) for r in (scan_roots or [])}
     for folder in path.parents:
         name = folder.name
         if not name:                              # reached a drive root
             return None
-        if _is_unorganised_folder_name(name):     # date / serial / camera dump
-            continue
-        if _is_container_or_device(name):          # bucket / device / scratch
-            continue
-        if _sanitize_event(name):                  # a usable label survives
+        if (not _is_unorganised_folder_name(name)  # date / serial / camera dump
+                and not _is_container_or_device(name)  # bucket / device / scratch
+                and _sanitize_event(name)):            # a usable label survives
             return folder
+        if roots and _norm_path(folder) in roots:
+            # Reached a scan-input root with no usable label → no event; do not
+            # climb into storage folders above the root.
+            return None
     return None
 
 
@@ -417,7 +439,9 @@ def _is_camera_original_name(filename: str | None) -> bool:
 MAX_EVENT_SPAN_DAYS = 30
 
 
-def _compute_event_groups(db: Database, stage_ids: set[int]) -> dict[str, dict]:
+def _compute_event_groups(
+    db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None
+) -> dict[str, dict]:
     """
     Group kept photos by their RESOLVED event folder (`_resolve_event_folder`,
     which climbs past camera-dump / date-divider subfolders) and classify each
@@ -439,6 +463,12 @@ def _compute_event_groups(db: Database, stage_ids: set[int]) -> dict[str, dict]:
     the user, those are organised by name, not exploded into hundreds of per-day
     folders — that scattering is exactly what the subject collection avoids.
     Only UN-named long-span folders (resolve → None) remain bulk dumps.
+
+    Date source is `_effective_date` (EXIF, else filesystem mtime fallback), not
+    bare EXIF — this is what lets VIDEO (often EXIF/QuickTime-metadata-less) and
+    UNKNOWN-status photos enter grouping at all. A side effect: photos with no
+    EXIF date that previously fell straight through to the no-date/per-day path
+    now participate in event/subject grouping via mtime, same as everything else.
     """
     from collections import defaultdict as _dd
 
@@ -448,12 +478,14 @@ def _compute_event_groups(db: Database, stage_ids: set[int]) -> dict[str, dict]:
         for row in batch:
             if row["status"] == "error" or row["file_id"] in stage_ids:
                 continue
-            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
-                continue  # videos use their own layout; UNKNOWN stays in place
-            dt = _parse_exif_dt(row["datetime_original"])
+            if row["file_type"] not in (
+                "RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC", "VIDEO",
+            ):
+                continue  # UNKNOWN stays in place
+            dt, _used_mtime = _effective_date(row)
             if dt is None:
                 continue
-            folder = _resolve_event_folder(Path(row["path"]))
+            folder = _resolve_event_folder(Path(row["path"]), scan_roots)
             if folder is None:
                 continue  # no real label → per-day / no-event fallback
             key = str(folder)
@@ -744,6 +776,7 @@ def _build_target_path(
     known_cameras: set[str],
     counters: dict[tuple, int],
     event_groups: dict[str, dict] | None = None,
+    scan_roots: list[Path] | None = None,
 ) -> Path:
     """
     Compute the reorganised destination path for a file to keep.
@@ -770,6 +803,10 @@ def _build_target_path(
       Videos/{YYYY}/{YYYY-MM-DD}_{event}_{seq:04d}.EXT
       Videos/NoDate/{event}_{seq:04d}.EXT  — no EXIF datetime
       The {event} segment is dropped when the parent folder name is unusable.
+      Subject collection (resolved folder spans > MAX_EVENT_SPAN_DAYS days):
+        Videos/{label}/{YYYY}/{YYYY-MM-DD}_{seq:04d}.EXT
+        Videos/{label}/NoDate/video_{seq:04d}.EXT  — this file itself has no date
+        — same rationale as the photo branch: a recurring theme, not one outing.
 
     Filename collisions inside a folder are resolved by the executor
     (it appends _conflict_N when a destination already exists).
@@ -779,6 +816,27 @@ def _build_target_path(
 
     # ── Videos: dedicated tree, date-only, event = source parent folder ──────
     if row["file_type"] == "VIDEO":
+        resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+        group = (event_groups or {}).get(str(resolved)) if resolved else None
+
+        if group and group["kind"] == "subject":
+            # Mirrors the photo subject branch: a named folder spanning months/
+            # years is a recurring theme (child, pet, revisited place), not one
+            # outing — keep videos together under the label instead of scattering
+            # them into bare Videos/{YYYY}/.
+            label = group["label"] or _sanitize_event(Path(row["path"]).parent.name)
+            if dt is None:
+                subdir = target_root / "Videos" / label / "NoDate"
+                stem = "video"
+            else:
+                subdir = target_root / "Videos" / label / dt.strftime("%Y")
+                stem = dt.strftime("%Y-%m-%d")
+            key = (str(subdir), stem)
+            seq = counters.get(key, 0)
+            counters[key] = seq + 1
+            return subdir / f"{stem}_{seq:04d}.{ext}"
+
+        # ── original logic, unchanged: event / no-group / unresolved ─────────
         event = _sanitize_event(Path(row["path"]).parent.name)
         if dt is None:
             subdir = target_root / "Videos" / "NoDate"
@@ -797,7 +855,7 @@ def _build_target_path(
     # ── Photos: event / subject folder, original filename preserved ──────────
     # The label comes from the RESOLVED event folder (climbs past camera-dump /
     # date-divider subfolders); falls back to "" (no label) when unresolved.
-    resolved = _resolve_event_folder(Path(row["path"]))
+    resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
     event = _sanitize_event(resolved.name) if resolved else ""
     group = (event_groups or {}).get(str(resolved)) if resolved else None
 
@@ -916,7 +974,7 @@ def audit_dates(db: Database, today: date | None = None) -> dict[str, int]:
 
 
 def plan(db: Database, target_root: Path, force: bool = False,
-         assume_yes: bool = False) -> None:
+         assume_yes: bool = False, scan_roots: list[Path] | None = None) -> None:
     """
     Phase 4: build the operations table and prompt the user to confirm.
 
@@ -1071,7 +1129,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
     # Pre-measure event/subject groups so each resolved folder maps to one
     # destination folder (multi-day event, or year-subdivided subject collection).
     with console.status("Measuring event date spans…"):
-        event_groups = _compute_event_groups(db, stage_ids)
+        event_groups = _compute_event_groups(db, stage_ids, scan_roots)
         db.commit()
 
     for batch in db.iter_files():
@@ -1098,7 +1156,8 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 if used_mtime and _dt is not None:
                     mtime_fallback += 1
                 target = _build_target_path(
-                    row, target_root, known_cameras, counters, event_groups
+                    row, target_root, known_cameras, counters, event_groups,
+                    scan_roots,
                 )
                 ops.append({
                     "file_id": fid,

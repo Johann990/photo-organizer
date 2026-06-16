@@ -182,7 +182,9 @@ def _match_event(row: Any, events: list[_Event], known_cameras: set[str]) -> _Ev
 # Event spans over the NEW files ONLY (never the whole library)
 # ---------------------------------------------------------------------------
 
-def _new_event_groups(rows: list[Any]) -> dict[str, dict]:
+def _new_event_groups(
+    rows: list[Any], scan_roots: list[Path] | None = None
+) -> dict[str, dict]:
     """
     Event / subject groups computed over the NEW rows ONLY.
 
@@ -199,7 +201,7 @@ def _new_event_groups(rows: list[Any]) -> dict[str, dict]:
         dt = _parse_exif_dt(row["datetime_original"])
         if dt is None:
             continue
-        folder = _resolve_event_folder(Path(row["path"]))
+        folder = _resolve_event_folder(Path(row["path"]), scan_roots)
         if folder is None:
             continue
         key = str(folder)
@@ -264,6 +266,7 @@ def plan_additions(
     target_root: Path,
     *,
     hamming_threshold: int = DEFAULT_HAMMING,
+    scan_roots: list[Path] | None = None,
 ) -> dict[str, int]:
     """
     Build 'planned' operations for the NEW (un-organized) files only and return a
@@ -388,7 +391,7 @@ def plan_additions(
 
     # ── Placement: into a matched existing event, else a NEW event folder ─────
     events = _existing_events(db)
-    new_spans = _new_event_groups(new_rows)
+    new_spans = _new_event_groups(new_rows, scan_roots)
     staging_root = target_root / "_staging" / "to_delete"
     counters: dict[tuple, int] = {}
     now = _now()
@@ -417,12 +420,14 @@ def plan_additions(
                 summary["into_existing"] += 1
             else:
                 target = _build_target_path(
-                    row, target_root, known_cameras, counters, new_spans
+                    row, target_root, known_cameras, counters, new_spans,
+                    scan_roots,
                 )
                 summary["new_events"] += 1
         else:  # VIDEO → its own dated tree (sequence collisions handled at execute)
             target = _build_target_path(
-                row, target_root, known_cameras, counters, new_spans
+                row, target_root, known_cameras, counters, new_spans,
+                scan_roots,
             )
             summary["new_events"] += 1
 
@@ -514,7 +519,8 @@ def add(
     dedup_exact(db, workers=workers, force=True)
     dedup_near(db, workers=workers, hamming_threshold=hamming_threshold, force=True)
 
-    summary = plan_additions(db, target_root, hamming_threshold=hamming_threshold)
+    summary = plan_additions(db, target_root, hamming_threshold=hamming_threshold,
+                             scan_roots=sources)
 
     if summary["new"] == 0:
         print_success("No new files to add — the library is already up to date.")

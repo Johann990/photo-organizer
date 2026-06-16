@@ -246,9 +246,10 @@ def cmd_plan(args):
         sys.exit(1)
 
     from .planner import plan
+    scan_roots = cfg.input_dirs if (cfg and cfg.input_dirs) else None
     with Database(db_path) as db:
         plan(db, target_root=target, force=getattr(args, "force", False),
-             assume_yes=getattr(args, "yes", False))
+             assume_yes=getattr(args, "yes", False), scan_roots=scan_roots)
 
 
 def cmd_execute(args):
