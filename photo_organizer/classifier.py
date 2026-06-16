@@ -62,14 +62,19 @@ HEIC_EXTENSIONS: frozenset[str] = frozenset({"heic", "heif"})
 # Resized signals
 # ---------------------------------------------------------------------------
 
-# Confirmed by user: path component named "resized" (case-insensitive)
-_RESIZED_FOLDER_CONFIRMED = "resized"
+# Confirmed folder names — any path *component* matching one of these
+# (case-insensitive) is unconditionally RESIZED_JPEG, no secondary needed.
+# Checked against path.parts so "resize" in "my-resize-2024.jpg" won't fire.
+_RESIZED_FOLDER_CONFIRMED: frozenset[str] = frozenset({
+    "resize", "resized",
+    "thumb", "thumbs", "thumbnail", "thumbnails",
+})
 
 # Secondary folder-name signals (enable after reviewing scan report)
 _RESIZED_FOLDER_SECONDARY: frozenset[str] = frozenset({
-    "resize", "export", "exports", "share", "shared", "sharing",
-    "web", "websize", "web_size", "small", "thumb", "thumbs",
-    "thumbnails", "preview", "previews", "instagram", "ig",
+    "export", "exports", "share", "shared", "sharing",
+    "web", "websize", "web_size", "small",
+    "preview", "previews", "instagram", "ig",
     "blog", "send", "sent", "proof", "proofs",
 })
 
@@ -164,9 +169,9 @@ class FileClassifier:
         if ext not in JPEG_EXTENSIONS:
             return "UNKNOWN"
 
-        # ── Rule 3 (confirmed): path contains "resized" ───────────────────
-        path_str_lower = str(path).lower()
-        if _RESIZED_FOLDER_CONFIRMED in path_str_lower:
+        # ── Rule 3 (confirmed): a path component is a known resize/thumb folder ──
+        folder_parts = {p.lower() for p in path.parts[:-1]}  # exclude filename
+        if folder_parts & _RESIZED_FOLDER_CONFIRMED:
             return "RESIZED_JPEG"
 
         # Developed-from-RAW / edited JPEG — positive ID via editing software.

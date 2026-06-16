@@ -13,8 +13,8 @@ Already-moved files (a 'done' MOVE op) are IMMUTABLE. Their event folder name is
 a FACT, not something to recompute. So `add`:
   * never creates an operation for, moves, or renames any 'done' file;
   * never recomputes event spans across the whole library (the existing
-    planner._compute_event_spans walks ALL files — we deliberately do NOT use it
-    for `add`); event spans for NEW files are computed over the NEW files only;
+    planner._compute_event_groups walks ALL files — we deliberately do NOT use it
+    for `add`); event groups for NEW files are computed over the NEW files only;
   * places a new file INTO an existing materialized event folder (using that
     folder's EXISTING name) when it shares the event's source-folder lineage or
     its date falls inside the event's existing date range; otherwise it creates
@@ -50,6 +50,8 @@ from .planner import (
     _build_target_path,
     _effective_date,
     _parse_exif_dt,
+    _resolve_event_folder,
+    _sanitize_event,
     keep_score,
 )
 from .progress import console, print_phase_header, print_success, print_warning
@@ -180,31 +182,39 @@ def _match_event(row: Any, events: list[_Event], known_cameras: set[str]) -> _Ev
 # Event spans over the NEW files ONLY (never the whole library)
 # ---------------------------------------------------------------------------
 
-def _new_event_spans(rows: list[Any]) -> dict[str, dict]:
+def _new_event_groups(rows: list[Any]) -> dict[str, dict]:
     """
-    Multi-day event spans computed over the NEW rows ONLY (2…MAX_EVENT_SPAN_DAYS).
+    Event / subject groups computed over the NEW rows ONLY.
 
     Deliberately scoped to the new files so adding cannot change the span/name of
-    any already-materialized event. Mirrors planner._compute_event_spans' shape
-    ({parent: {"start", "span"}}) so it plugs straight into _build_target_path.
+    any already-materialized event. Mirrors planner._compute_event_groups' shape
+    (keyed by RESOLVED event folder → {"kind": "event"|"subject", …}) so it plugs
+    straight into _build_target_path.
     """
-    dates_by_parent: dict[str, list[date]] = defaultdict(list)
+    dates_by_folder: dict[str, list[date]] = defaultdict(list)
+    label_by_folder: dict[str, str] = {}
     for row in rows:
         if row["file_type"] not in _PHOTO_TYPES:
             continue
         dt = _parse_exif_dt(row["datetime_original"])
         if dt is None:
             continue
-        dates_by_parent[str(Path(row["path"]).parent)].append(dt.date())
+        folder = _resolve_event_folder(Path(row["path"]))
+        if folder is None:
+            continue
+        key = str(folder)
+        dates_by_folder[key].append(dt.date())
+        label_by_folder.setdefault(key, _sanitize_event(folder.name))
 
-    spans: dict[str, dict] = {}
-    for parent, dates in dates_by_parent.items():
+    groups: dict[str, dict] = {}
+    for key, dates in dates_by_folder.items():
         dmin, dmax = min(dates), max(dates)
         span = (dmax - dmin).days + 1
-        if span <= 1 or span > MAX_EVENT_SPAN_DAYS:
-            continue
-        spans[parent] = {"start": dmin, "span": span}
-    return spans
+        if span > MAX_EVENT_SPAN_DAYS:
+            groups[key] = {"kind": "subject", "label": label_by_folder[key]}
+        elif span > 1:
+            groups[key] = {"kind": "event", "start": dmin, "span": span}
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +388,7 @@ def plan_additions(
 
     # ── Placement: into a matched existing event, else a NEW event folder ─────
     events = _existing_events(db)
-    new_spans = _new_event_spans(new_rows)
+    new_spans = _new_event_groups(new_rows)
     staging_root = target_root / "_staging" / "to_delete"
     counters: dict[tuple, int] = {}
     now = _now()

@@ -22,6 +22,7 @@ from rich import box
 from rich.table import Table
 
 from .db import Database
+from .folders_report import write_no_event_report
 from .progress import console, print_phase_header, print_success
 
 
@@ -250,18 +251,35 @@ def _sanitize_camera(model: str | None) -> str:
     return s[:20] or "Unknown"
 
 
+_LEADING_DATE = re.compile(
+    r"^(?:"
+    r"\d{8}(?:_\d{6})?"       # 20100815 / 20100815_143022
+    r"|\d{4}_\d{4}"           # 2010_2012  (year range)
+    r"|\d{4}(?:_\d{2}){1,2}"  # 2010_08 / 2010_08_15
+    r"|\d{4}"                 # 2012  (standalone year)
+    r")(?=_|$)"
+)
+
+
 def _sanitize_event(folder_name: str | None) -> str:
     """
     Filesystem-safe, truncated 'event & location' string derived from the
     source file's parent folder name.  Returns "" when unusable (empty or a
     drive root like 'E:\\'), so the caller can omit the segment entirely.
+
+    The date is always added separately as the folder PREFIX
+    ({YYYY-MM-DD}_{event}), so a leading date stamp inside the source folder
+    name is redundant and is stripped — "20100815 倩家" → "倩家", "2012 Trip"
+    → "Trip".  Separator runs (including literal underscores, since '_' is a
+    word char) collapse to a single '_'.
     """
     if not folder_name:
         return ""
     # A drive-root parent (e.g. "E:\\") has no real name component.
     if re.fullmatch(r"[A-Za-z]:[\\/]?", folder_name):
         return ""
-    s = re.sub(r"[^\w]+", "_", folder_name).strip("_")
+    s = re.sub(r"[\W_]+", "_", folder_name).strip("_")
+    s = _LEADING_DATE.sub("", s).strip("_")
     return s[:40]
 
 
@@ -286,9 +304,12 @@ def _is_unorganised_folder_name(name: str | None) -> bool:
         return True
     if re.fullmatch(r"\d+", n):                        # pure number / sequence
         return True
-    if re.fullmatch(r"\d{3}[-_]?[A-Za-z0-9]{2,6}", n): # 100CANON / 101NIKON / 100_FUJI
-        return True
     low = n.lower()
+    # 100CANON / 101NIKON / 100_FUJI, optionally with a .done/.old/.bak/_copy
+    # archival suffix (100EOS5D.done) — the suffix marks a processed dump, so the
+    # climb skips it and reaches the real event/subject above (小英照, 小蓉訂婚).
+    if re.fullmatch(r"\d{3}[-_]?[a-z0-9]{2,6}(?:[._](?:done|old|bak|copy))?", low):
+        return True
     if low == "dcim":
         return True
     # single camera-filename-style dump (IMG_1234, DSC01234, P1010001, GOPR0001)
@@ -297,27 +318,132 @@ def _is_unorganised_folder_name(name: str | None) -> bool:
     return False
 
 
+# Container / device / temp folder names that carry NO event or subject meaning.
+# Unlike `_is_unorganised_folder_name` (which catches dates/serials/camera dumps),
+# these are real *words* that nonetheless must never become an event/subject label
+# — they name a storage bucket, a device, or a scratch area, not a moment or a
+# theme. Used by `_resolve_event_folder` so the climb skips past them instead of
+# stopping and mislabelling everything "Sony_TX5" / "Raw_Files" / "手機 Sony DCIM".
+_CONTAINER_NAMES: frozenset[str] = frozenset({
+    # storage buckets
+    "raw_files", "rawtank", "raw_old", "albums", "album", "photos", "照片",
+    "jpg", "jpeg", "jpegtank", "depository_aged", "完整備份相簿",
+    "slides", "pic", "pics", "samples", "icqreceived_old", "thmbnl", "thmbnls",
+    "待整理",                              # "to be organised" — a TODO bucket
+    "m4root",                              # Sony Memory Stick standard root dir
+    # RAW-processing / derivative-export output dirs (the real event is ABOVE
+    # them: …/20081101 小蓉訂婚/Develops/ → 小蓉訂婚).  Mirrors the resize/share
+    # tokens used by `_derivative_event_root` for redundant-copy staging.
+    "develop", "develops", "developed", "export", "exports", "share",
+    # software/junk dirs seen in the wild (MS Office sample images, etc.)
+    "station", "office11",
+})
+
+# Substrings / patterns marking a device dump, scratch area, or burn batch.
+_DEVICE_SUBSTRINGS = ("手機", "ipad", "iphone")   # phone/tablet backup dumps
+_CONTAINER_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^dcim"),                 # DCIM / DCIM_Storage / DCIM_Working
+    re.compile(r"^temp(\d+|_\d+)?$"),     # Temp / Temp2011 / Temp_20100627 (scratch)
+    re.compile(r"已燒錄"),                 # "_200602 已燒錄_4.35" (CD/DVD burn batch)
+    re.compile(r"^\d{6}$"),               # 200609 — bare 6-digit burn/date label
+    re.compile(r"^v\d+_"),                # "V50 小鐵" → v50_… (phone model + nick)
+    re.compile(r"(?:_|^)[tf]x\d"),        # Sony_TX5 / Sweden_FX5 (camera models)
+]
+
+
+def _is_container_or_device(name: str | None) -> bool:
+    """True when a folder name is a storage bucket / device / scratch area —
+    a real word that must NOT be used as an event or subject label."""
+    if not name:
+        return True
+    norm = re.sub(r"[\W_]+", "_", name).strip("_").lower()
+    if not norm:
+        return True
+    if norm in _CONTAINER_NAMES:
+        return True
+    if any(s in norm for s in _DEVICE_SUBSTRINGS):
+        return True
+    return any(p.search(norm) for p in _CONTAINER_PATTERNS)
+
+
+def _resolve_event_folder(path: Path) -> Path | None:
+    """Climb from a file's parent folder up to the nearest ancestor that carries
+    a real event/subject label, returning that folder (or None if none exists).
+
+    The DATE always comes from EXIF (date forensics) — this resolves only the
+    LABEL. Photos are often buried in camera-dump subfolders (151CANON) or
+    date-divider subfolders (200909) under the meaningful folder (郁, 小英照,
+    20050814 蒙古), so we skip past names that are unorganised (date/serial/dump)
+    or a container/device/scratch bucket, and stop at the first real name.
+
+    Returns the FIRST (lowest) qualifying ancestor, so a real event folder is
+    never overshot into its storage parent (…/Albums/2013/墾丁凱撒/JPG/x.jpg
+    resolves to 墾丁凱撒, not Albums).
+    """
+    for folder in path.parents:
+        name = folder.name
+        if not name:                              # reached a drive root
+            return None
+        if _is_unorganised_folder_name(name):     # date / serial / camera dump
+            continue
+        if _is_container_or_device(name):          # bucket / device / scratch
+            continue
+        if _sanitize_event(name):                  # a usable label survives
+            return folder
+    return None
+
+
+# Camera-original filenames: a prefix the camera assigns + a sequence number.
+# The camera gives EACH shutter actuation its own number, so two DIFFERENT
+# camera-original names can never be the same shot copied — they are distinct
+# frames (a burst).  A renamed/exported copy loses this form (image00017.jpg),
+# which is how Edge 2 tells a copy apart from a burst.
+_CAMERA_ORIGINAL_NAME = re.compile(
+    r"(?:img|_mg|dsc|dscf|dscn|pict?|photo|mvi|gopr|pano|cimg|hpim|sdc|dji)"
+    r"[-_]?\d{3,}",
+    re.IGNORECASE,
+)
+
+
+def _is_camera_original_name(filename: str | None) -> bool:
+    """True when the filename looks like an unedited camera original
+    (IMG_9606, DSC03639, P1010001) rather than a renamed export."""
+    stem = Path(filename or "").stem.strip()
+    return bool(_CAMERA_ORIGINAL_NAME.fullmatch(stem))
+
+
 # Source folders whose photo dates span more than this many days are treated
 # as "not a single outing" (e.g. a phone dump) and fall back to per-day folders.
 MAX_EVENT_SPAN_DAYS = 30
 
 
-def _compute_event_spans(db: Database, stage_ids: set[int]) -> dict[str, dict]:
+def _compute_event_groups(db: Database, stage_ids: set[int]) -> dict[str, dict]:
     """
-    Group kept photos by their source parent folder and measure each group's
-    date span (earliest → latest EXIF date).
+    Group kept photos by their RESOLVED event folder (`_resolve_event_folder`,
+    which climbs past camera-dump / date-divider subfolders) and classify each
+    group by its EXIF date span:
 
-    Returns a map  parent_path_str → {"start": date, "span": int}  ONLY for
-    groups that span 2…MAX_EVENT_SPAN_DAYS days (a genuine multi-day event).
+        kind="event"   2…MAX_EVENT_SPAN_DAYS days → one date-prefixed folder
+                       {"start": date, "span": int}
+        kind="subject" > MAX_EVENT_SPAN_DAYS days → a named collection, kept
+                       together and subdivided by year ({label}/{YYYY}/)
+                       {"label": str}
 
-    Single-day groups are omitted (they fall back to {YYYY-MM-DD}_{event}).
-    Groups spanning > MAX_EVENT_SPAN_DAYS days are omitted and logged as WARN —
-    they fall back to per-day folders, since such a folder is almost certainly
-    a bulk dump rather than one outing.
+    Returned map is keyed by the resolved folder path string. Single-day groups
+    are omitted (handled inline as {YYYY-MM-DD}_{event}). Files whose folder does
+    not resolve to a real name (None) are omitted too — they fall back to the
+    per-day / no-event path in `_build_target_path`.
+
+    Why a long span splits the two: a named folder spanning months/years is not
+    one outing but a recurring SUBJECT (a child, a pet, a place revisited). Per
+    the user, those are organised by name, not exploded into hundreds of per-day
+    folders — that scattering is exactly what the subject collection avoids.
+    Only UN-named long-span folders (resolve → None) remain bulk dumps.
     """
     from collections import defaultdict as _dd
 
-    dates_by_parent: dict[str, list] = _dd(list)
+    dates_by_folder: dict[str, list] = _dd(list)
+    label_by_folder: dict[str, str] = {}
     for batch in db.iter_files():
         for row in batch:
             if row["status"] == "error" or row["file_id"] in stage_ids:
@@ -327,25 +453,31 @@ def _compute_event_spans(db: Database, stage_ids: set[int]) -> dict[str, dict]:
             dt = _parse_exif_dt(row["datetime_original"])
             if dt is None:
                 continue
-            dates_by_parent[str(Path(row["path"]).parent)].append(dt.date())
+            folder = _resolve_event_folder(Path(row["path"]))
+            if folder is None:
+                continue  # no real label → per-day / no-event fallback
+            key = str(folder)
+            dates_by_folder[key].append(dt.date())
+            label_by_folder.setdefault(key, _sanitize_event(folder.name))
 
-    spans: dict[str, dict] = {}
-    for parent, dates in dates_by_parent.items():
+    groups: dict[str, dict] = {}
+    for key, dates in dates_by_folder.items():
         dmin, dmax = min(dates), max(dates)
         span = (dmax - dmin).days + 1
-        if span <= 1:
-            continue  # single day → handled as {YYYY-MM-DD}_{event}
+        label = label_by_folder[key]
         if span > MAX_EVENT_SPAN_DAYS:
+            groups[key] = {"kind": "subject", "label": label}
             db.log(
-                "WARN",
-                f"Source folder spans {span} days "
-                f"({dmin.isoformat()}…{dmax.isoformat()}) — exceeds "
-                f"{MAX_EVENT_SPAN_DAYS}-day event limit; using per-day folders.",
-                phase="review", path=parent,
+                "INFO",
+                f"Subject collection '{label}' spans {span} days "
+                f"({dmin.isoformat()}…{dmax.isoformat()}) — organised as "
+                f"{label}/{{year}}/ instead of per-day folders.",
+                phase="review", path=key,
             )
-            continue
-        spans[parent] = {"start": dmin, "span": span}
-    return spans
+        elif span > 1:
+            groups[key] = {"kind": "event", "start": dmin, "span": span}
+        # span == 1 → single-day event, handled inline with the resolved label
+    return groups
 
 
 def keep_score(row: Any, known_cameras: set[str]) -> tuple:
@@ -488,8 +620,10 @@ def redundant_copy_ids(db: Database) -> set[int]:
     tiny thumbnail is always staged when a larger sibling exists.  A unique shot
     (singleton component) is never staged.  RAW/VIDEO are out of scope (only
     CAMERA_JPEG/DEV_JPEG/HEIC), so RAW masters are always kept.  Genuine bursts
-    (consecutive frames: different filenames AND different pHash) are NOT linked,
-    so they remain for near-duplicate review.  DB-only — no disk read.
+    are NOT linked — two DIFFERENT camera-original filenames are distinct shutter
+    actuations even when their pHash is identical (Hamming 0), so Edge 2 only
+    links a non-camera-original export name to a shot; the burst pair remains for
+    near-duplicate review.  DB-only — no disk read.
     """
     rows = db.conn.execute(
         "SELECT file_id, filename, path, width, height, size_bytes, "
@@ -536,14 +670,29 @@ def redundant_copy_ids(db: Database) -> set[int]:
                 if abs(ai - aj) <= _RESIZE_ASPECT_TOL:
                     union(members[i]["file_id"], members[j]["file_id"])
 
-    # Edge 2 — same (datetime, identical non-junk pHash): renamed/re-encoded copy.
-    by_content: dict[tuple[str, str], list[int]] = defaultdict(list)
+    # Edge 2 — same (datetime, identical non-junk pHash): a renamed/re-encoded
+    # COPY of one shot.  But two DIFFERENT camera-original filenames at the same
+    # instant are distinct shutter actuations (a burst), never one shot copied —
+    # so a copy is only ever a NON-camera-original name (image00017.jpg).  Link
+    # such exports to the best camera original (or, if the group is all exports,
+    # to each other); never link camera-original ↔ camera-original, leaving real
+    # bursts for near-duplicate review.
+    by_content: dict[tuple[str, str], list[Any]] = defaultdict(list)
     for r in rows:
         if r["phash"] and r["phash"] not in junk:
-            by_content[(r["datetime_original"], r["phash"])].append(r["file_id"])
-    for ids in by_content.values():
-        for fid in ids[1:]:
-            union(ids[0], fid)
+            by_content[(r["datetime_original"], r["phash"])].append(r)
+    for members in by_content.values():
+        if len(members) < 2:
+            continue
+        cameras = [m for m in members if _is_camera_original_name(m["filename"])]
+        exports = [m for m in members if not _is_camera_original_name(m["filename"])]
+        if cameras:
+            anchor = max(cameras, key=lambda m: keep_score(m, known))["file_id"]
+            for e in exports:
+                union(anchor, e["file_id"])
+        else:
+            for m in members[1:]:
+                union(members[0]["file_id"], m["file_id"])
 
     components: dict[int, list[int]] = defaultdict(list)
     for fid in parent:
@@ -594,22 +743,29 @@ def _build_target_path(
     target_root: Path,
     known_cameras: set[str],
     counters: dict[tuple, int],
-    event_spans: dict[str, dict] | None = None,
+    event_groups: dict[str, dict] | None = None,
 ) -> Path:
     """
     Compute the reorganised destination path for a file to keep.
 
-    Photos (event folder, ORIGINAL filename kept):
+    The {event} label is the RESOLVED event folder name (`_resolve_event_folder`
+    climbs past camera-dump / date-divider subfolders), so a photo buried in
+    …/20050814 蒙古/0808/IMG.jpg is labelled "蒙古", not "0808".
+
+    Photos (ORIGINAL filename kept):
       Single-day event:
         Masters/{YYYY}/{YYYY-MM-DD}_{event}/{original_name}
-      Multi-day event (2…MAX_EVENT_SPAN_DAYS days, from event_spans):
+      Multi-day event (2…MAX_EVENT_SPAN_DAYS days, from event_groups):
         Masters/{YYYY}/{start-date}_{N}d_{event}/{original_name}
         — ALL of the event's files land in this one folder (year = start year).
+      Subject collection (named folder spanning > MAX_EVENT_SPAN_DAYS days):
+        Masters/{event}/{YYYY}/{original_name}
+        — kept together under the name, subdivided by year (NOT per-day).
       Others/  — camera not in known_cameras list
       NoDate/  — no EXIF datetime
-      The {event} segment is dropped when the parent folder name is unusable,
-      leaving just {YYYY-MM-DD}/ (or {start-date}_{N}d/).  RAW+JPEG pairs keep
-      the same stem naturally because the original camera filenames are preserved.
+      The {event} segment is dropped when the folder does not resolve to a real
+      name, leaving just {YYYY-MM-DD}/ (or {start-date}_{N}d/).  RAW+JPEG pairs
+      keep the same stem naturally because original camera filenames are kept.
     Videos (own layout — date only, parent folder as event/location):
       Videos/{YYYY}/{YYYY-MM-DD}_{event}_{seq:04d}.EXT
       Videos/NoDate/{event}_{seq:04d}.EXT  — no EXIF datetime
@@ -638,8 +794,12 @@ def _build_target_path(
         counters[key] = seq + 1
         return subdir / f"{stem}_{seq:04d}.{ext}"
 
-    # ── Photos: per-day event folder, original filename preserved ───────────
-    event = _sanitize_event(Path(row["path"]).parent.name)
+    # ── Photos: event / subject folder, original filename preserved ──────────
+    # The label comes from the RESOLVED event folder (climbs past camera-dump /
+    # date-divider subfolders); falls back to "" (no label) when unresolved.
+    resolved = _resolve_event_folder(Path(row["path"]))
+    event = _sanitize_event(resolved.name) if resolved else ""
+    group = (event_groups or {}).get(str(resolved)) if resolved else None
 
     if dt is None:
         subdir = target_root / "NoDate"
@@ -649,15 +809,18 @@ def _build_target_path(
         in_known = bool(model_lower and model_lower in known_cameras)
         base = target_root / ("Masters" if in_known else "Others")
 
-        # Multi-day event? Use the precomputed start-date + span; the whole
-        # event collapses into one folder under its start year.
-        span_info = (event_spans or {}).get(str(Path(row["path"]).parent))
-        if span_info:
-            start = span_info["start"]
-            label = f"{start.isoformat()}_{span_info['span']}d"
-            folder = f"{label}_{event}" if event else label
+        if group and group["kind"] == "subject":
+            # Long-span named collection: keep together, subdivide by year only.
+            folder = group["label"] or event
+            subdir = base / folder / dt.strftime("%Y")
+        elif group and group["kind"] == "event":
+            # Multi-day event: whole event collapses into one start-year folder.
+            start = group["start"]
+            stamp = f"{start.isoformat()}_{group['span']}d"
+            folder = f"{stamp}_{event}" if event else stamp
             subdir = base / start.strftime("%Y") / folder
         else:
+            # Single-day event (or unresolved): per-day folder with the label.
             day = dt.strftime("%Y-%m-%d")
             folder = f"{day}_{event}" if event else day
             subdir = base / dt.strftime("%Y") / folder
@@ -905,9 +1068,10 @@ def plan(db: Database, target_root: Path, force: bool = False,
     ops: list[dict] = []
     mtime_fallback = 0   # files dated from filesystem mtime (no EXIF date)
 
-    # Pre-measure multi-day events so each source folder maps to one event folder.
+    # Pre-measure event/subject groups so each resolved folder maps to one
+    # destination folder (multi-day event, or year-subdivided subject collection).
     with console.status("Measuring event date spans…"):
-        event_spans = _compute_event_spans(db, stage_ids)
+        event_groups = _compute_event_groups(db, stage_ids)
         db.commit()
 
     for batch in db.iter_files():
@@ -934,7 +1098,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 if used_mtime and _dt is not None:
                     mtime_fallback += 1
                 target = _build_target_path(
-                    row, target_root, known_cameras, counters, event_spans
+                    row, target_root, known_cameras, counters, event_groups
                 )
                 ops.append({
                     "file_id": fid,
@@ -1075,10 +1239,23 @@ def plan(db: Database, target_root: Path, force: bool = False,
         if len(no_event_src) > 30:
             ne_table.add_row(f"[dim]… +{len(no_event_src) - 30} more[/dim]", "")
         console.print(ne_table)
+
+        # Write the COMPLETE list to a collapsible, sortable HTML report.
+        report_path = db.path.parent / "_staging" / "no_event_folders.html"
+        try:
+            write_no_event_report(no_event_src, report_path)
+            console.print(
+                f"  Full interactive list (expand/collapse + sort): "
+                f"[cyan]{report_path}[/cyan]"
+            )
+        except OSError as e:
+            db.log("WARN", f"Could not write no-event HTML report: {e}",
+                   phase="review")
+
         console.print(
             "  Their names are just a date / number / camera dump (e.g. 2023-06-15, 100CANON, DCIM),\n"
             "  so the target folder has no event/location label.\n"
-            "  Full list recorded in run_log — review later with:\n"
+            "  Full list also recorded in run_log — review later with:\n"
             "    [cyan]SELECT path, message FROM run_log "
             "WHERE phase='review' AND message LIKE 'No-event%';[/cyan]\n"
         )
@@ -1100,9 +1277,16 @@ def plan(db: Database, target_root: Path, force: bool = False,
 
     # ── 6. Confirm ───────────────────────────────────────────────────────────
     if not assume_yes:
+        console.print(
+            "  [dim]Above is only a PREVIEW — no files have been touched yet.[/dim]\n"
+            "  [bold]y[/bold] = approve this plan (marks the operations as "
+            "confirmed). Nothing moves until you then run "
+            "[cyan]execute[/cyan].\n"
+            "  [bold]N[/bold] = discard this plan and change nothing.\n"
+        )
         try:
             ans = input(
-                "Mark all operations as confirmed and proceed to Phase 5? [y/N] "
+                "Approve this plan?  (move/stage files later via 'execute')  [y/N] "
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = ""

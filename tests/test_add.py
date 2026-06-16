@@ -115,12 +115,15 @@ def test_add_places_new_and_freezes_existing(tmp_path):
         assert len(b_ops) == 1 and b_ops[0]["op_type"] == "MOVE"
         assert Path(b_ops[0]["target_path"]).parent == event_dir
 
-        # (c) new date → a NEW event folder (not the existing one).
+        # (c) new date, outside the event range → NOT forced into the frozen
+        #     event. Kyoto2's new files span 2023-06-16…2023-09-01 (>30 days),
+        #     so Kyoto2 is now a SUBJECT collection — organised by name + year
+        #     (Masters/Kyoto2/{YYYY}/), not a per-day event folder.
         c_ops = _ops_for(db, newdate)
         assert len(c_ops) == 1 and c_ops[0]["op_type"] == "MOVE"
         c_parent = Path(c_ops[0]["target_path"]).parent
         assert c_parent != event_dir
-        assert c_parent.name.startswith("2023-09-01")
+        assert c_parent.name == "2023" and c_parent.parent.name == "Kyoto2"
 
         # (d) same source lineage → into the EXISTING event folder.
         d_ops = _ops_for(db, lineage)
