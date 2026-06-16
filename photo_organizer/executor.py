@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -470,6 +471,14 @@ def undo(db: Database, force: bool = False) -> None:
     )
 
     if not force:
+        # A non-interactive shell (background / piped stdin) can't answer the
+        # prompt — input() would block forever.  Refuse safely; --force confirms.
+        if not sys.stdin.isatty():
+            print_warning(
+                "Non-interactive shell — pass --force to confirm undo. "
+                "Nothing changed."
+            )
+            return
         try:
             ans = input("Proceed with undo? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):

@@ -2,6 +2,18 @@
 
 讀 SKILL.md 了解完整需求和架構。
 
+## Session 工作流程 / Session workflow
+
+本專案的工作刻意拆成兩個獨立 session,各司其職:
+
+- **「SCM GitHub」session** — 只負責版本控制／GitHub 操作:`git`、`gh`、commit、push、PR、merge、分支清理。所有這類動作都**移到該 session 執行**(可由本 session 透過 subagent 代為觸發,但決策歸 SCM session)。
+- **「Run Phase commands」session** — 只負責跑 pipeline 指令:`scan` / `report` / `dedup` / `review` / `plan` / `execute` / `add` / `clone` 等,以及實際庫的整理動作。**執行相關的動作留在這個 session。**
+
+**絕對規則 / Hard rule:**
+
+> **🚫 永遠不要自動 archive 任何 session。** 即使任務看似完成、session 看似閒置,也**絕不**主動呼叫 archive(`mcp__ccd_session_mgmt__archive_session` 或任何等效操作)。Archive 只能由使用者**明確指示**時才執行。
+> / **NEVER auto-archive a session.** Even when a task looks done or a session looks idle, do not call archive on your own initiative. Archive only on the user's explicit instruction.
+
 ## 實作狀態
 
 | Phase | 模組 | 狀態 |
@@ -113,13 +125,13 @@ python -m photo_organizer execute --db C:\photos.db
 
 - **重複副本自動清除 / Redundant-copy auto-staging**（`planner.redundant_copy_ids`）：同一張照片常有多個版本——重新存過的 JPEG（**位元組不同** EXACT SHA-256 抓不到）、分享匯出、縮圖（**改了檔名**或縮太多 **pHash 漂走** near 也配不上）→ 漏網污染 review。`plan` 用 **union-find** 把「同一張」的所有副本連成一個連通分量，每個分量**只留 keep_score 最佳版**、其餘全標 `STAGE_DELETE`（預覽列「Redundant copies (re-encodes + resizes)」）。兩種「同一張」連結各自安全：
   - **連結 1 — 同檔名 + 同時間 + 同長寬比**：同（檔名 stem + EXIF `datetime_original`）且長寬比相符（容差 `_RESIZE_ASPECT_TOL`）→ 同一張相機影格被重存／縮放（**任何尺寸**,連 pHash 漂走的小縮圖也算）。長寬比不同（**裁切**或旋轉）**不連** → 保留。
-  - **連結 2 — 同時間 + 同 pHash（非垃圾）**：即使**檔名被改**（如 `image00017.jpg`）也認得出是同一張。
+  - **連結 2 — 同時間 + 同 pHash（非垃圾）**：認出**改名的副本**（如 `image00017.jpg`）。但**只連「非相機原始檔名」的匯出副本**到該張的最佳相機原檔；**兩個不同的相機原始檔名**（`IMG_9606` vs `IMG_9607`，`_is_camera_original_name`）是相機各自配號的**不同影格**，即使 pHash 完全相同（Hamming 0）也**不連** → 連拍兩格都保留、留進 near review。（相機每按一次快門配一個流水號,故不同號=不同張;同號的副本走連結 1 的同 stem。）
   - **資料夾規則 — 衍生匯出夾**：位於 `share`／`resize`／`resize+crop`／`export`／`web`／`thumb`… 等衍生夾（token 比對，`Jpeg` 不算）的 JPEG，只要**同事件**裡有同檔名主檔存在 → 直接收。縮小+裁切的衍生檔會讓 **pHash 失效（不同張縮小後會撞同一個雜湊）**、EXIF 時間也常被剝掉，故改用**資料夾名稱**這個可靠訊號;主檔（與 RAW）在別處保住內容。
   - **為何不再用「誰最佳」的成對比較**：改用「依『張』分群」後沒有 keeper-vs-keeper 衝突——每個分量固定留一個存活者，所以**有更大版本存在時，小縮圖一定會被收**（修掉早期 `protected` 防護把漂走縮圖誤救回的 bug）。
-  - **鐵則**：唯一的一張（單一分量）永不刪。**RAW／VIDEO 不在範圍**，RAW 主檔永遠保留。無 `datetime_original` 不比對。**真正的連拍**（不同檔名 + 不同 pHash 的連續影格）**不會被連** → 留在 near review。
+  - **鐵則**：唯一的一張（單一分量）永不刪。**RAW／VIDEO 不在範圍**，RAW 主檔永遠保留。無 `datetime_original` 不比對。**真正的連拍**（不同相機原始檔名的連續影格,**無論 pHash 是否相同**）**不會被連** → 留在 near review。
   - **垃圾雜湊排除 / junk-phash excluded**：同一 pHash 被 ≥`JUNK_PHASH_MIN_FILES`（8，與 near 共用單一來源）個檔共用 → 不據以連結。
   - **安全網豁免 / safety-net exemption**：多餘副本的內容由**不同 sha 的更佳版**保住，故 `plan` 1d 安全網會**豁免** RESIZED／重複副本（否則單檔 sha 的副本會被誤救回）。也**排除出 near review** → 大幅減少人工審查。純算 DB、不讀碟、idempotent。
-  / `plan` links every copy of one shot into a connected component (union-find) and keeps only the keep_score best of each, staging the rest. Two safe edges: (1) same (filename stem + EXIF capture time) with matching aspect ratio — the same frame re-saved/downscaled at any size, even a pHash-drifted thumbnail; a different aspect (crop/rotation) is NOT linked, so crops are kept; (2) same (capture time + identical non-junk pHash) — catches renamed exports (image00017.jpg). Plus a folder rule: a JPEG in a derivative-export folder (share/resize/crop/…; "Jpeg" excluded) is staged when a same-stem master exists in the same event — downscaled+cropped exports collide in pHash across different shots and often have their date stripped, so the folder name is the reliable signal. Grouping by shot (not by which copy is "best") removes the keeper-vs-keeper conflict, so a thumbnail is always staged when a larger sibling exists. Unique shots are never staged; RAW/VIDEO out of scope (RAW masters kept); genuine bursts (different filename AND different pHash) stay in near review. Exempt from the 1d byte-survival net and excluded from near review.
+  / `plan` links every copy of one shot into a connected component (union-find) and keeps only the keep_score best of each, staging the rest. Two safe edges: (1) same (filename stem + EXIF capture time) with matching aspect ratio — the same frame re-saved/downscaled at any size, even a pHash-drifted thumbnail; a different aspect (crop/rotation) is NOT linked, so crops are kept; (2) same (capture time + identical non-junk pHash) — catches renamed exports (image00017.jpg). Plus a folder rule: a JPEG in a derivative-export folder (share/resize/crop/…; "Jpeg" excluded) is staged when a same-stem master exists in the same event — downscaled+cropped exports collide in pHash across different shots and often have their date stripped, so the folder name is the reliable signal. Grouping by shot (not by which copy is "best") removes the keeper-vs-keeper conflict, so a thumbnail is always staged when a larger sibling exists. Unique shots are never staged; RAW/VIDEO out of scope (RAW masters kept); genuine bursts (two different camera-original filenames are distinct shutter actuations even with an identical pHash) stay in near review — Edge 2 only links a non-camera-original export name to a shot, never camera-original ↔ camera-original. Exempt from the 1d byte-survival net and excluded from near review.
 
 ### 增量維護 / Incremental add（`add`）
 

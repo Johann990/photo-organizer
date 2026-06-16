@@ -205,6 +205,50 @@ def test_two_shots_same_second_kept_apart(tmp_path):
         assert redundant_copy_ids(db) == set()
 
 
+def test_consecutive_camera_burst_identical_phash_kept(tmp_path):
+    """Two DIFFERENT camera-original filenames at the same second with an
+    IDENTICAL pHash are distinct shutter actuations (a burst), NOT one shot
+    copied — both are kept.  Edge 2 must not link camera-vs-camera; the pair
+    surfaces in near review instead."""
+    with Database(tmp_path / "p.db") as db:
+        ph = "bcdc97884341e5a7"
+        _add(db, 1, "IMG_9606.jpg", w=1936, h=1288, dt="2010:08:15 15:11:01",
+             sha="a", phash=ph)
+        _add(db, 2, "IMG_9607.jpg", w=1936, h=1288, dt="2010:08:15 15:11:01",
+             sha="b", phash=ph, path="/a/IMG_9607.jpg")
+        db.commit()
+        assert redundant_copy_ids(db) == set()
+
+
+def test_camera_plus_renamed_export_still_staged(tmp_path):
+    """A real camera original + a renamed export (non-camera name) sharing pHash
+    and datetime: the export IS staged (Edge 2 still links camera ↔ export)."""
+    with Database(tmp_path / "p.db") as db:
+        ph = "bcdc97884341e5a7"
+        _add(db, 1, "IMG_9606.jpg", w=5616, h=3744, dt="2010:08:15 15:11:01",
+             sha="a", phash=ph)
+        _add(db, 2, "image00017.jpg", w=1800, h=1200, dt="2010:08:15 15:11:01",
+             sha="b", phash=ph, path="/share/image00017.jpg")
+        db.commit()
+        assert redundant_copy_ids(db) == {2}
+
+
+def test_export_sharing_phash_with_two_bursts_stages_only_export(tmp_path):
+    """An export colliding in pHash with two burst frames: stage the export,
+    keep BOTH camera originals (the export joins the best camera's component;
+    the other camera stays a singleton)."""
+    with Database(tmp_path / "p.db") as db:
+        ph = "bcdc97884341e5a7"
+        _add(db, 1, "IMG_9606.jpg", w=5616, h=3744, dt="2010:08:15 15:11:01",
+             sha="a", phash=ph)
+        _add(db, 2, "IMG_9607.jpg", w=5616, h=3744, dt="2010:08:15 15:11:01",
+             sha="b", phash=ph, path="/a/IMG_9607.jpg")
+        _add(db, 3, "image00017.jpg", w=1800, h=1200, dt="2010:08:15 15:11:01",
+             sha="c", phash=ph, path="/share/image00017.jpg")
+        db.commit()
+        assert redundant_copy_ids(db) == {3}
+
+
 def test_junk_phash_not_collapsed(tmp_path):
     """A pHash shared by >= 8 files is non-discriminative → never collapse on it.
 
