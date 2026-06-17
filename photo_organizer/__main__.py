@@ -318,6 +318,23 @@ def cmd_reconcile(args):
     sys.exit(0 if ok else 1)
 
 
+def cmd_relocate(args):
+    cfg = _load_cfg(args)
+    from .relocate import relocate
+    scan_roots = list(cfg.input_dirs) if cfg else [getattr(args, "root", None)]
+    scan_roots = [r for r in scan_roots if r]
+    if not scan_roots:
+        print_error("relocate needs scan roots: --config with input_dirs, or a ROOT arg.")
+        sys.exit(1)
+    with Database(_db_path(args, cfg)) as db:
+        summary = relocate(db, scan_roots)
+    console.print(
+        f"relocate: {summary['relocated']:,} re-pointed, "
+        f"{summary['lost']:,} LOST (of {summary['stale']:,} stale)."
+    )
+    sys.exit(0 if summary["lost"] == 0 else 1)
+
+
 def cmd_clone(args):
     cfg = _load_cfg(args)
     dest = getattr(args, "dest", None)
@@ -575,6 +592,14 @@ def build_parser() -> argparse.ArgumentParser:
              "(I/O; flags any 'done' file missing from its claimed location)",
     )
     p_recon.set_defaults(func=cmd_reconcile)
+
+    # relocate — re-point files.path for manually-moved files via sha256
+    p_reloc = sub.add_parser(
+        "relocate", parents=[shared],
+        help="Re-point files.path for manually-moved files via sha256 (no rebuild)",
+    )
+    p_reloc.add_argument("root", nargs="?", help="Optional scan root (else config input_dirs)")
+    p_reloc.set_defaults(func=cmd_relocate)
 
     # clone — non-destructive incremental backup to another volume
     p_clone = sub.add_parser(
