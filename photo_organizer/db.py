@@ -736,6 +736,8 @@ class Database:
             "WHERE overlap_id=?",
             (keeper, reviewed_at, overlap_id),
         )
+        if self.conn.execute("SELECT changes()").fetchone()[0] == 0:
+            raise KeyError(f"overlap_id {overlap_id} not found in folder_overlaps")
 
     def reopen_folder_overlap(self, overlap_id: int) -> None:
         self.conn.execute(
@@ -743,6 +745,8 @@ class Database:
             "WHERE overlap_id=?",
             (overlap_id,),
         )
+        if self.conn.execute("SELECT changes()").fetchone()[0] == 0:
+            raise KeyError(f"overlap_id {overlap_id} not found in folder_overlaps")
 
     # ---- run_log -----------------------------------------------------------
 

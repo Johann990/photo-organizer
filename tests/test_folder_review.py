@@ -48,3 +48,11 @@ def test_reopen_folder_overlap(tmp_path):
         ).fetchone()
         assert row["status"] == "pending"
         assert row["reviewed_at"] is None
+
+
+def test_record_decision_raises_on_unknown_id(tmp_path):
+    import pytest
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        with pytest.raises(KeyError, match="999"):
+            db.record_folder_overlap_decision(999, "a", "2026-01-01T00:00:00+00:00")
