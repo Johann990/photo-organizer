@@ -56,3 +56,21 @@ def test_record_decision_raises_on_unknown_id(tmp_path):
     with Database(db_path) as db:
         with pytest.raises(KeyError, match="999"):
             db.record_folder_overlap_decision(999, "a", "2026-01-01T00:00:00+00:00")
+
+
+def test_serve_get_renders_pair(tmp_path):
+    import urllib.request
+    from photo_organizer.folderreview import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        _add_overlap(db, "D:\\Canon\\Trip", "D:\\Backup\\Trip")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+            body = urllib.request.urlopen(url).read().decode()
+            assert "D:\\Canon\\Trip" in body
+            assert "D:\\Backup\\Trip" in body
+            assert "shared" in body.lower()
+        finally:
+            httpd.shutdown()
