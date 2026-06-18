@@ -446,6 +446,18 @@ def cmd_timings(args):
     console.print(table)
 
 
+def cmd_folder_merge(args):
+    cfg = _load_cfg(args)
+    from .folder_merge import detect_and_store
+    scan_roots = list(cfg.input_dirs) if cfg else []
+    if not scan_roots:
+        print_error("folder-merge needs scan roots: --config with input_dirs.")
+        sys.exit(1)
+    with Database(_db_path(args, cfg)) as db:
+        n = detect_and_store(db, scan_roots, show_progress=True)
+    console.print(f"folder-merge: {n:,} twin-folder pair(s) recorded in folder_overlaps.")
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -676,6 +688,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use secondary resized-JPEG signals (match the setting used at scan time)",
     )
     p_reclass.set_defaults(func=cmd_reclassify)
+
+    # folder-merge
+    p_fmerge = sub.add_parser(
+        "folder-merge", parents=[shared],
+        help="Detect twin folders (wholesale copies) → folder_overlaps table",
+    )
+    p_fmerge.set_defaults(func=cmd_folder_merge)
 
     # timings
     p_timings = sub.add_parser(

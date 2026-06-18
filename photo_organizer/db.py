@@ -89,6 +89,22 @@ CREATE TABLE IF NOT EXISTS duplicates (
     UNIQUE(file_id_a, file_id_b)
 );
 
+CREATE TABLE IF NOT EXISTS folder_overlaps (
+    overlap_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder_a     TEXT    NOT NULL,
+    folder_b     TEXT    NOT NULL,
+    shared_count INTEGER NOT NULL,
+    a_only_count INTEGER NOT NULL,
+    b_only_count INTEGER NOT NULL,
+    coverage_a   REAL    NOT NULL,
+    coverage_b   REAL    NOT NULL,
+    keeper       TEXT    CHECK(keeper IN ('a','b') OR keeper IS NULL),
+    status       TEXT    NOT NULL DEFAULT 'pending'
+                 CHECK(status IN ('pending','reviewed')),
+    reviewed_at  TEXT,
+    UNIQUE(folder_a, folder_b)
+);
+
 CREATE TABLE IF NOT EXISTS operations (
     op_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id      INTEGER NOT NULL REFERENCES files(file_id),
@@ -172,7 +188,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
 # SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
 # guard, not the migration mechanism: migrations stay idempotent ALTERs.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SchemaVersionError(RuntimeError):
@@ -690,6 +706,29 @@ class Database:
                 "SELECT COUNT(*) FROM duplicates WHERE dup_type = ?", (dup_type,)
             ).fetchone()[0]
         return self.conn.execute("SELECT COUNT(*) FROM duplicates").fetchone()[0]
+
+    # ---- folder_overlaps ---------------------------------------------------
+
+    def clear_folder_overlaps(self):
+        self.conn.execute("DELETE FROM folder_overlaps")
+
+    def insert_folder_overlap(self, *, folder_a, folder_b, shared_count,
+                              a_only_count, b_only_count, coverage_a,
+                              coverage_b, keeper=None):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO folder_overlaps "
+            "(folder_a, folder_b, shared_count, a_only_count, b_only_count, "
+            " coverage_a, coverage_b, keeper) VALUES (?,?,?,?,?,?,?,?)",
+            (folder_a, folder_b, shared_count, a_only_count, b_only_count,
+             coverage_a, coverage_b, keeper),
+        )
+
+    def iter_folder_overlaps(self, pending_only: bool = False):
+        sql = "SELECT * FROM folder_overlaps"
+        if pending_only:
+            sql += " WHERE status='pending'"
+        sql += " ORDER BY shared_count DESC"
+        return self.conn.execute(sql).fetchall()
 
     # ---- run_log -----------------------------------------------------------
 
