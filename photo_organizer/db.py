@@ -730,6 +730,20 @@ class Database:
         sql += " ORDER BY shared_count DESC"
         return self.conn.execute(sql).fetchall()
 
+    def record_folder_overlap_decision(self, overlap_id: int, keeper, reviewed_at: str) -> None:
+        self.conn.execute(
+            "UPDATE folder_overlaps SET status='reviewed', keeper=?, reviewed_at=? "
+            "WHERE overlap_id=?",
+            (keeper, reviewed_at, overlap_id),
+        )
+
+    def reopen_folder_overlap(self, overlap_id: int) -> None:
+        self.conn.execute(
+            "UPDATE folder_overlaps SET status='pending', reviewed_at=NULL "
+            "WHERE overlap_id=?",
+            (overlap_id,),
+        )
+
     # ---- run_log -----------------------------------------------------------
 
     def log(self, level: str, message: str, phase: str | None = None,
