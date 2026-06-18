@@ -117,3 +117,29 @@ def test_multiple_pairs(tmp_path):
     assert loser2 in ids
     assert loser3 not in ids
     assert unique == 1
+
+
+def test_plan_creates_stage_delete_for_loser(tmp_path):
+    from photo_organizer.planner import plan
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    target.mkdir()
+
+    with Database(db_path) as db:
+        # Keeper folder: one file
+        keeper_id = _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
+        # Loser folder: one duplicate (same SHA) + one unique (different SHA)
+        loser_dup_id = _add_file(db, r"D:\B\img001.jpg", sha=SHA_A)
+        loser_uniq_id = _add_file(db, r"D:\B\img002.jpg", sha=SHA_C)
+        _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
+
+        plan(db, target, assume_yes=True)
+
+        ops = {
+            r["file_id"]: r["op_type"]
+            for r in db.conn.execute("SELECT file_id, op_type FROM operations")
+        }
+        assert ops[loser_dup_id] == "STAGE_DELETE"        # duplicate staged
+        assert ops.get(loser_uniq_id) != "STAGE_DELETE"   # unique NOT staged
+        assert ops[keeper_id] == "MOVE"                   # keeper moved normally

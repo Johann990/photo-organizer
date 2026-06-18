@@ -1129,7 +1129,15 @@ def plan(db: Database, target_root: Path, force: bool = False,
     stage_ids.update(redundant_copy_losers)
     content_safe_stage.update(redundant_copy_losers)
 
-    # 1d. Safety net — never stage EVERY byte-identical copy of a file.
+    # 1d. Folder-merge loser staging — files in reviewed "loser" folders whose
+    # SHA-256 is confirmed present in the "keeper" folder subtree.
+    with console.status("Staging folder-merge losers…"):
+        folder_merge_losers, fm_unique_count = _folder_merge_loser_ids(db)
+    stage_ids.update(folder_merge_losers)
+    # NOT added to content_safe_stage: keeper has the same SHA, so the 1e
+    # safety net correctly protects the keeper copy without exemption.
+
+    # 1e. Safety net — never stage EVERY byte-identical copy of a file.
     # EXACT and NEAR resolution choose keepers independently, so their staging
     # sets can overlap in a way that stages all copies of one sha256 group
     # (e.g. a NEAR loser that is also another group's only EXACT survivor).
@@ -1152,6 +1160,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
             stage_ids.discard(keeper)
             near_dup_losers.discard(keeper)
             dup_non_keepers.discard(keeper)
+            folder_merge_losers.discard(keeper)
             rescued += 1
     if rescued:
         db.log(
@@ -1310,6 +1319,18 @@ def plan(db: Database, target_root: Path, force: bool = False,
             "[red]Stage for deletion — Near-dupes (reviewed)[/red]",
             f"{len(near_dup_losers):,}",
             "your keep/discard choices from 'review'",
+        )
+    if folder_merge_losers:
+        t.add_row(
+            "[red]Stage for deletion — Folder-merge losers[/red]",
+            f"{len(folder_merge_losers):,}",
+            "redundant copies in folded-in folder; keeper has all SHA-256s",
+        )
+    if fm_unique_count:
+        t.add_row(
+            "[yellow]Unique files in loser folder(s)[/yellow]",
+            f"{fm_unique_count:,}",
+            "no SHA match in keeper — moved to library normally",
         )
     t.add_row(
         "[green]Move + rename → Masters/ or Others/[/green]",
