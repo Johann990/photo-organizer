@@ -199,3 +199,85 @@ def test_cli_relocate_prune_flag():
     assert args.func is m.cmd_relocate and args.prune is True
     args2 = parser.parse_args(["relocate", "--db", "x.db"])
     assert args2.prune is False
+
+
+def test_prune_missing_deletes_stale_keeps_present(tmp_path):
+    from photo_organizer.relocate import prune_missing
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    present = tmp_path / "present.jpg"
+    present.write_bytes(b"x")
+    with Database(db_path) as db:
+        stale = _add(db, tmp_path / "gone" / "a.jpg", sha256="aaaa")
+        survivor = _add(db, present, sha256="bbbb")
+        # Dependents referencing the stale row.
+        db.conn.execute(
+            "INSERT INTO duplicates (file_id_a, file_id_b, dup_type) VALUES (?,?,'EXACT')",
+            (stale, survivor),
+        )
+        db.conn.execute(
+            "INSERT INTO operations (file_id, op_type, source_path, status) "
+            "VALUES (?, 'MOVE', ?, 'planned')",
+            (stale, str(tmp_path / "gone" / "a.jpg")),
+        )
+        db.commit()
+
+        summary = prune_missing(db)
+
+        assert summary["pruned"] >= 1
+        # stale row + dependents gone
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (stale,)).fetchone()[0] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM duplicates WHERE file_id_a=? OR file_id_b=?", (stale, stale)
+        ).fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM operations WHERE file_id=?", (stale,)).fetchone()[0] == 0
+        # present row kept
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (survivor,)).fetchone()[0] == 1
+
+
+def test_prune_missing_keeps_done(tmp_path):
+    from photo_organizer.relocate import prune_missing
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        done = _add(db, tmp_path / "gone" / "c.jpg", sha256="cccc", status="done")
+        db.commit()
+
+        summary = prune_missing(db)
+
+        assert summary["kept_done"] == 1
+        assert summary["pruned"] == 0
+        # 'done' row with a missing file is NOT pruned.
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (done,)).fetchone()[0] == 1
+
+
+def test_cli_relocate_prune_only_flag():
+    import photo_organizer.__main__ as m
+    parser = m.build_parser()
+    args = parser.parse_args(["relocate", "--db", "x.db", "--prune-only"])
+    assert args.prune_only is True and args.func is m.cmd_relocate
+
+
+def test_prune_creates_fk_indexes_to_avoid_fulltable_scan(tmp_path):
+    # Regression: with foreign_keys=ON, deleting a files row makes SQLite verify
+    # nothing still references it. files has self-referential FKs raw_pair_id /
+    # jpeg_pair_id; unindexed, they force a FULL files-table scan per deleted row
+    # (caused a >1h hang on the real 280k-row library). _prune_rows must create
+    # indexes on every column referencing files(file_id) so the prune stays fast.
+    from photo_organizer.relocate import _prune_rows
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        fid = _add(db, tmp_path / "gone" / "a.jpg", sha256="aaaa")
+        row = db.conn.execute("SELECT * FROM files WHERE file_id=?", (fid,)).fetchone()
+        _prune_rows(db, [row], tmp_path / "report.txt")
+        idx = {
+            r[0]
+            for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert {
+            "idx_files_raw_pair", "idx_files_jpeg_pair",
+            "idx_dup_file_b", "idx_dup_keep", "idx_runlog_file",
+        } <= idx

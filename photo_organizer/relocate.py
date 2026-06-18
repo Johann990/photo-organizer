@@ -24,13 +24,31 @@ from .deduper import _sha256_file
 from .scanner import discover_files
 
 
-def find_stale_rows(db: Database) -> list:
-    """Return non-error file rows whose recorded path no longer exists."""
+def find_stale_rows(db: Database, show_progress: bool = False) -> list:
+    """Return non-error file rows whose recorded path no longer exists.
+
+    This stats every indexed file on disk (hundreds of thousands of rows →
+    minutes on a spinning HDD), so the CLI passes show_progress=True to render
+    a progress bar; callers that just need the list (tests) leave it off.
+    """
     rows = db.conn.execute(
         "SELECT file_id, path, filename, sha256, status FROM files "
         "WHERE sha256 IS NOT NULL AND status != 'error'"
     ).fetchall()
-    return [r for r in rows if not os.path.exists(r["path"])]
+    if not show_progress:
+        return [r for r in rows if not os.path.exists(r["path"])]
+
+    from .progress import PhaseProgress
+
+    stale: list = []
+    with PhaseProgress(
+        "Checking files on disk", total=len(rows), phase="relocate"
+    ) as prog:
+        for r in rows:
+            if not os.path.exists(r["path"]):
+                stale.append(r)
+            prog.advance(1, current_path=r["path"])
+    return stale
 
 
 def _match_rows_to_paths(rows: list, cands: list) -> list:
@@ -86,12 +104,24 @@ def _prune_rows(db: Database, lost_rows: list, report_path: Path) -> tuple[int, 
     db.conn.execute("CREATE TEMP TABLE IF NOT EXISTS _prune_ids (file_id INTEGER PRIMARY KEY)")
     db.conn.execute("DELETE FROM _prune_ids")
     db.conn.executemany("INSERT INTO _prune_ids(file_id) VALUES (?)", [(i,) for i in ids])
-    # Dependents first (FK ON, no cascade), then the files rows.
-    db.conn.execute(
-        "DELETE FROM duplicates WHERE file_id_a IN (SELECT file_id FROM _prune_ids) "
-        "OR file_id_b IN (SELECT file_id FROM _prune_ids) "
-        "OR keep_file_id IN (SELECT file_id FROM _prune_ids)"
-    )
+    # Indexes the schema lacks on every column that references files(file_id).
+    # Without them, with foreign_keys=ON, two things blow up on a large library:
+    #   1. the per-column dependent deletes below would scan their whole table;
+    #   2. far worse — deleting a files row makes SQLite verify NO row still
+    #      references it, and files has TWO self-referential FKs (raw_pair_id,
+    #      jpeg_pair_id) with no index, forcing a FULL files-table scan PER
+    #      deleted row (39,615 × 2 × 282,976 ≈ 22B scans → a >1h hang).
+    # Indexing both reference sets turns the whole prune from hours into seconds
+    # (empirically ~8s). Idempotent + useful beyond prune.
+    db.conn.execute("CREATE INDEX IF NOT EXISTS idx_dup_file_b ON duplicates(file_id_b)")
+    db.conn.execute("CREATE INDEX IF NOT EXISTS idx_dup_keep ON duplicates(keep_file_id)")
+    db.conn.execute("CREATE INDEX IF NOT EXISTS idx_runlog_file ON run_log(file_id)")
+    db.conn.execute("CREATE INDEX IF NOT EXISTS idx_files_raw_pair ON files(raw_pair_id)")
+    db.conn.execute("CREATE INDEX IF NOT EXISTS idx_files_jpeg_pair ON files(jpeg_pair_id)")
+    # Dependents first (FK ON, no cascade), split per column so each uses an index.
+    db.conn.execute("DELETE FROM duplicates WHERE file_id_a IN (SELECT file_id FROM _prune_ids)")
+    db.conn.execute("DELETE FROM duplicates WHERE file_id_b IN (SELECT file_id FROM _prune_ids)")
+    db.conn.execute("DELETE FROM duplicates WHERE keep_file_id IN (SELECT file_id FROM _prune_ids)")
     db.conn.execute("DELETE FROM operations WHERE file_id IN (SELECT file_id FROM _prune_ids)")
     db.conn.execute("DELETE FROM run_log WHERE file_id IN (SELECT file_id FROM _prune_ids)")
     db.conn.execute("DELETE FROM files WHERE file_id IN (SELECT file_id FROM _prune_ids)")
@@ -100,7 +130,32 @@ def _prune_rows(db: Database, lost_rows: list, report_path: Path) -> tuple[int, 
     return len(prunable), len(kept_done)
 
 
-def relocate(db: Database, scan_roots: list, prune: bool = False) -> dict:
+def prune_missing(db: Database, show_progress: bool = False) -> dict:
+    """Prune rows whose file is gone from disk, WITHOUT re-discovering/re-pointing.
+
+    Assumes a prior `relocate` already re-pointed movable files; the remaining
+    stale rows are treated as removed from the library. Much faster than
+    relocate --prune (no os.walk, no hashing). Returns
+    {"stale", "pruned", "kept_done"}.
+    """
+    stale = find_stale_rows(db, show_progress=show_progress)
+    report = db.path.parent / "_staging" / "pruned_paths.txt"
+    pruned, kept_done = _prune_rows(db, stale, report)
+    for r in stale:
+        if r["status"] == "done":
+            db.log("ERROR",
+                   f"LOST 'done' file (organized file missing, NOT pruned): {r['path']}",
+                   phase="relocate", file_id=r["file_id"], path=r["path"])
+    db.log("INFO",
+           f"Pruned {pruned} orphaned row(s) (files removed from library); "
+           f"paths listed in {report}.", phase="relocate")
+    db.commit()
+    return {"stale": len(stale), "pruned": pruned, "kept_done": kept_done}
+
+
+def relocate(
+    db: Database, scan_roots: list, prune: bool = False, show_progress: bool = False
+) -> dict:
     """Re-point stale file rows to their moved location by sha256.
 
     With prune=True, rows still missing after relocation (and not status
@@ -108,7 +163,7 @@ def relocate(db: Database, scan_roots: list, prune: bool = False) -> dict:
     reflects the current library. Returns
     {"stale", "relocated", "lost", "pruned"}.
     """
-    stale = find_stale_rows(db)
+    stale = find_stale_rows(db, show_progress=show_progress)
     if not stale:
         return {"stale": 0, "relocated": 0, "lost": 0, "pruned": 0}
 

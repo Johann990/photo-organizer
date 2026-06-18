@@ -321,13 +321,23 @@ def cmd_reconcile(args):
 def cmd_relocate(args):
     cfg = _load_cfg(args)
     from .relocate import relocate
+    if getattr(args, "prune_only", False):
+        from .relocate import prune_missing
+        with Database(_db_path(args, cfg)) as db:
+            summary = prune_missing(db, show_progress=True)
+        console.print(
+            f"prune-only: {summary['pruned']:,} pruned, "
+            f"{summary['kept_done']:,} 'done' kept (of {summary['stale']:,} stale)."
+        )
+        sys.exit(0)
     scan_roots = list(cfg.input_dirs) if cfg else [getattr(args, "root", None)]
     scan_roots = [r for r in scan_roots if r]
     if not scan_roots:
         print_error("relocate needs scan roots: --config with input_dirs, or a ROOT arg.")
         sys.exit(1)
     with Database(_db_path(args, cfg)) as db:
-        summary = relocate(db, scan_roots, prune=getattr(args, "prune", False))
+        summary = relocate(db, scan_roots, prune=getattr(args, "prune", False),
+                           show_progress=True)
     console.print(
         f"relocate: {summary['relocated']:,} re-pointed, "
         f"{summary['pruned']:,} pruned, "
@@ -606,6 +616,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete DB rows whose file was removed from the library (path gone, "
              "not found in scan roots). Keeps 'done' rows. Writes pruned paths to "
              "_staging/pruned_paths.txt.",
+    )
+    p_reloc.add_argument(
+        "--prune-only", action="store_true",
+        help="Prune rows whose file is gone WITHOUT re-walking/re-pointing "
+             "(fast; assumes you already ran relocate).",
     )
     p_reloc.set_defaults(func=cmd_relocate)
 
