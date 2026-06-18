@@ -382,6 +382,9 @@ def cmd_review(args):
         if getattr(args, "auto", False):
             from .reviewer import auto_resolve_near_dupes
             auto_resolve_near_dupes(db, commit=getattr(args, "commit", False))
+        elif getattr(args, "folders", False):
+            from .folderreview import serve as folder_serve
+            folder_serve(db, port=getattr(args, "port", 0))
         elif getattr(args, "web", False):
             from .webreview import serve
             serve(db, review_all=getattr(args, "all", False),
@@ -730,7 +733,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_review.add_argument(
         "--port", type=int, default=0,
-        help="With --web: TCP port to bind on 127.0.0.1 (default: ephemeral)",
+        help="With --web or --folders: TCP port to bind on 127.0.0.1 (default: ephemeral)",
+    )
+    p_review.add_argument(
+        "--folders", action="store_true",
+        help="Review twin-folder pairs (from folder-merge) instead of near-duplicate images",
     )
     p_review.set_defaults(func=cmd_review)
 
