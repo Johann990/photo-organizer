@@ -191,9 +191,17 @@ class FolderReviewState:
                 "SELECT path, filename FROM files "
                 "WHERE status != 'error' ORDER BY path"
             ):
-                parent = str(PureWindowsPath(r["path"]).parent)
-                if parent in needed and len(samples[parent]) < _SAMPLE_LIMIT:
-                    samples[parent].append(r["filename"])
+                # Walk from direct parent up to drive root so that rolled-up
+                # ancestor overlap pairs (where files live in subfolders) also
+                # get sample filenames, not just direct-child pairs.
+                cur = str(PureWindowsPath(r["path"]).parent)
+                while True:
+                    if cur in needed and len(samples[cur]) < _SAMPLE_LIMIT:
+                        samples[cur].append(r["filename"])
+                    up = str(PureWindowsPath(cur).parent)
+                    if up == cur:
+                        break
+                    cur = up
 
         self.db = db
         self.samples: dict[str, list[str]] = dict(samples)
