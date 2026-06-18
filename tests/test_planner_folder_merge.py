@@ -119,6 +119,24 @@ def test_multiple_pairs(tmp_path):
     assert unique == 1
 
 
+def test_nested_subtree_match(tmp_path):
+    # folder_overlaps rows are rolled-up ancestors: the files live in SUBfolders.
+    # The keeper SHA and the loser file are both nested below the recorded folder,
+    # so the ancestor-walk must reach the rolled-up folder name from each path.
+    # Also guards the sibling-prefix case (D:\B vs D:\B2 must not collide).
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        _add_file(db, r"D:\A\Album\2003\img001.jpg", sha=SHA_A)
+        loser_id = _add_file(db, r"D:\B\Album\2003\img001.jpg", sha=SHA_A)
+        # Sibling folder whose name is a prefix of the loser folder — must NOT match.
+        unrelated = _add_file(db, r"D:\B2\img999.jpg", sha=SHA_A)
+        _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
+        ids, unique = _folder_merge_loser_ids(db)
+    assert loser_id in ids
+    assert unrelated not in ids
+    assert unique == 0
+
+
 def test_plan_creates_stage_delete_for_loser(tmp_path):
     from photo_organizer.planner import plan
 
