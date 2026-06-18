@@ -766,6 +766,61 @@ def redundant_copy_ids(db: Database) -> set[int]:
     return losers
 
 
+def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
+    """Return (loser_file_ids_to_stage, unique_to_loser_count).
+
+    For each reviewed folder_overlap with a keeper:
+    - Files in the loser subtree whose SHA-256 exists in the keeper subtree
+      → returned in loser_ids (to be STAGE_DELETE'd by plan).
+    - Files unique to the loser (no SHA match, or sha=NULL)
+      → counted in unique_count; NOT staged; move through normal pipeline.
+    - Files with status='done' or status='error' → skipped entirely.
+    - keeper=NULL ('both') → no staging for that pair (filtered by SQL).
+
+    DB-only, no disk reads, idempotent.
+    """
+    reviewed = db.conn.execute(
+        "SELECT folder_a, folder_b, keeper "
+        "FROM folder_overlaps "
+        "WHERE status='reviewed' AND keeper IN ('a','b')"
+    ).fetchall()
+
+    if not reviewed:
+        return set(), 0
+
+    loser_ids: set[int] = set()
+    unique_count = 0
+
+    for row in reviewed:
+        if row["keeper"] == "a":
+            keeper_folder, loser_folder = row["folder_a"], row["folder_b"]
+        else:
+            keeper_folder, loser_folder = row["folder_b"], row["folder_a"]
+
+        # SHA-256s present anywhere in the keeper subtree
+        keeper_shas: set[str] = {
+            r["sha256"]
+            for r in db.conn.execute(
+                "SELECT sha256 FROM files "
+                "WHERE path LIKE ? AND sha256 IS NOT NULL AND status != 'error'",
+                (keeper_folder + "\\%",),
+            )
+        }
+
+        # Files in the loser subtree (exclude done/error)
+        for f in db.conn.execute(
+            "SELECT file_id, sha256 FROM files "
+            "WHERE path LIKE ? AND status NOT IN ('error', 'done')",
+            (loser_folder + "\\%",),
+        ):
+            if f["sha256"] is None or f["sha256"] not in keeper_shas:
+                unique_count += 1
+            else:
+                loser_ids.add(f["file_id"])
+
+    return loser_ids, unique_count
+
+
 # ---------------------------------------------------------------------------
 # Target path builder
 # ---------------------------------------------------------------------------
