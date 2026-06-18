@@ -179,3 +179,51 @@ def test_cli_review_folders_wired():
     parser = m.build_parser()
     args = parser.parse_args(["review", "--folders", "--db", "x.db"])
     assert args.func is m.cmd_review and args.folders is True
+
+
+def test_pairs_grouped_by_parent(tmp_path):
+    import urllib.request
+    from photo_organizer.folderreview import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        _add_overlap(db, "D:\\X\\Album\\2003", "D:\\Y\\Album\\2003")
+        _add_overlap(db, "D:\\X\\Album\\2004", "D:\\Y\\Album\\2004")
+        _add_overlap(db, "D:\\X\\Album\\2005", "D:\\Y\\Album\\2005")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+            body = urllib.request.urlopen(url).read().decode()
+            # All three pairs share parent pair (D:\X\Album, D:\Y\Album) -> one group.
+            assert body.count("<details") == 1
+            assert "D:\\X\\Album\\2003" in body
+            assert "D:\\X\\Album\\2004" in body
+            assert "D:\\X\\Album\\2005" in body
+            assert "D:\\Y\\Album\\2003" in body
+            assert "D:\\Y\\Album\\2004" in body
+            assert "D:\\Y\\Album\\2005" in body
+        finally:
+            httpd.shutdown()
+
+
+def test_reviewed_group_collapsed_pending_open(tmp_path):
+    import urllib.request
+    from photo_organizer.folderreview import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        # Group 1: pending pair -> should render open.
+        _add_overlap(db, "D:\\Pending\\Album\\2003", "D:\\Other\\Album\\2003")
+        # Group 2: fully reviewed pair -> should render collapsed.
+        oid2 = _add_overlap(db, "D:\\Done\\Album\\2003", "D:\\Done2\\Album\\2003")
+        db.record_folder_overlap_decision(oid2, "a", datetime.now(timezone.utc).isoformat())
+        db.commit()
+
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+            body = urllib.request.urlopen(url).read().decode()
+            assert body.count('<details class="group" open>') == 1
+            assert body.count('<details class="group">') == 1
+        finally:
+            httpd.shutdown()

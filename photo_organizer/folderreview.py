@@ -77,7 +77,20 @@ h1 { font-size: 1.25rem; margin: 0 0 .2rem; }
 .actionbar button.primary { background: #238636; color: #fff; border: 1px solid #2ea043;
              border-radius: 6px; padding: .4rem 1rem; cursor: pointer; font-size: .85rem; }
 .actionbar button.primary:hover { background: #2ea043; }
+.actionbar button.ghostbtn { background: #2b2f38; color: #e6e6e6; border: 1px solid #3a404b;
+             border-radius: 6px; padding: .4rem .8rem; cursor: pointer; font-size: .8rem; }
+.actionbar button.ghostbtn:hover { background: #353b46; }
 .allmsg { color: #8b93a1; font-size: .82rem; }
+details.group { margin: 0 0 1.1rem; }
+summary.ghead { background: #21262d; border: 1px solid #2b2f38; border-radius: 8px;
+                padding: .55rem .8rem; cursor: pointer; list-style: none; }
+summary.ghead::-webkit-details-marker { display: none; }
+summary.ghead .gicon { margin-right: .4rem; }
+summary.ghead .gpaths { font-family: monospace; font-size: .82rem; color: #c9d1d9;
+                         word-break: break-all; }
+summary.ghead .gpaths .arrow { color: #8b93a1; margin: 0 .3rem; }
+summary.ghead .gcount { color: #8b93a1; font-size: .78rem; margin-top: .25rem; }
+details.group[open] summary.ghead { border-radius: 8px 8px 0 0; margin-bottom: .6rem; }
 """
 
 # -----------------------------------------------------------------------
@@ -165,6 +178,8 @@ function saveAll() {
     }
   }).catch(() => { msg.textContent = 'error saving'; });
 }
+function expandAll() { document.querySelectorAll('details.group').forEach(d => d.open = true); }
+function collapseAll() { document.querySelectorAll('details.group').forEach(d => d.open = false); }
 """
 
 
@@ -206,6 +221,32 @@ class FolderReviewState:
         self.db = db
         self.samples: dict[str, list[str]] = dict(samples)
         self.lock = threading.Lock()
+        self.groups: list[dict] = self._build_groups()
+
+    def _build_groups(self) -> list[dict]:
+        """Group overlap rows by their parent-folder pair so the UI can
+        collapse twin-subfolder runs (e.g. .../Album/2003, 2004, 2005) into
+        one section."""
+        by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for row in self.overlaps:
+            key = (
+                str(PureWindowsPath(row["folder_a"]).parent),
+                str(PureWindowsPath(row["folder_b"]).parent),
+            )
+            by_key[key].append(row)
+
+        groups = []
+        for (ga, gb), rows in by_key.items():
+            rows = sorted(rows, key=lambda r: r["folder_a"])
+            groups.append({
+                "parent_a": ga,
+                "parent_b": gb,
+                "rows": rows,
+                "shared_total": sum(r["shared_count"] for r in rows),
+                "pending": sum(1 for r in rows if r["status"] != "reviewed"),
+            })
+        groups.sort(key=lambda g: (g["parent_a"], g["parent_b"]))
+        return groups
 
     def total(self) -> int:
         return len(self.overlaps)
@@ -293,16 +334,45 @@ def _pair_html(state: FolderReviewState, i: int, row: dict) -> str:
     )
 
 
+def _group_html(state: FolderReviewState, group: dict, start_index: int) -> str:
+    pending = group["pending"]
+    count_txt = (
+        f'{len(group["rows"]):,} twin subfolders &middot; '
+        f'{group["shared_total"]:,} shared &middot; '
+        + ("all reviewed" if pending == 0 else f"{pending:,} pending")
+    )
+    pairs_html = "".join(
+        _pair_html(state, start_index + j, row) for j, row in enumerate(group["rows"])
+    )
+    open_attr = " open" if pending > 0 else ""
+    return (
+        f'<details class="group"{open_attr}>'
+        f'<summary class="ghead">'
+        f'<span class="gicon">&#128193;</span>'
+        f'<span class="gpaths">{html.escape(group["parent_a"])}'
+        f'<span class="arrow">&harr;</span>{html.escape(group["parent_b"])}</span>'
+        f'<div class="gcount">{count_txt}</div>'
+        f'</summary>{pairs_html}</details>'
+    )
+
+
 def _render_page(state: FolderReviewState) -> bytes:
     total = state.total()
     if total == 0:
         body = '<p class="sub">No twin-folder pairs found. Run folder-merge first.</p>'
         actionbar = ""
     else:
-        body = "".join(_pair_html(state, i, row) for i, row in enumerate(state.overlaps))
+        chunks = []
+        idx = 0
+        for group in state.groups:
+            chunks.append(_group_html(state, group, idx))
+            idx += len(group["rows"])
+        body = "".join(chunks)
         actionbar = (
             f'<div class="actionbar">'
             f'<button class="primary" onclick="saveAll()">Save all {total} decisions</button>'
+            '<button class="ghostbtn" onclick="expandAll()">Expand all</button>'
+            '<button class="ghostbtn" onclick="collapseAll()">Collapse all</button>'
             '<span id="allmsg" class="allmsg"></span></div>'
         )
     doc = (
