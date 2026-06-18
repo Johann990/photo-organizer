@@ -88,7 +88,7 @@ def test_relocate_repoints_moved_file_and_preserves_decisions(tmp_path):
 
         summary = relocate(db, [scan_root])
 
-        assert summary == {"stale": 1, "relocated": 1, "lost": 0}
+        assert summary == {"stale": 1, "relocated": 1, "lost": 0, "pruned": 0}
         row = db.conn.execute(
             "SELECT path FROM files WHERE file_id = ?", (fid,)
         ).fetchone()
@@ -109,7 +109,7 @@ def test_relocate_logs_lost_when_no_sha_match(tmp_path):
         db.commit()
 
         summary = relocate(db, [scan_root])
-        assert summary == {"stale": 1, "relocated": 0, "lost": 1}
+        assert summary == {"stale": 1, "relocated": 0, "lost": 1, "pruned": 0}
         log = db.conn.execute(
             "SELECT message FROM run_log WHERE phase='relocate' "
             "AND file_id = ?", (fid,)
@@ -123,3 +123,79 @@ def test_cli_relocate_command_is_wired():
     parser = m.build_parser() if hasattr(m, "build_parser") else m._build_parser()
     args = parser.parse_args(["relocate", "--db", "x.db"])
     assert args.func is m.cmd_relocate
+
+
+def test_prune_rows_deletes_orphan_and_dependents_keeps_done(tmp_path):
+    from photo_organizer.relocate import _prune_rows
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        # Orphan source row (status hashed) + a survivor row.
+        orphan = _add(db, tmp_path / "gone" / "a.jpg", sha256="aaaa")
+        survivor = _add(db, tmp_path / "keep" / "b.jpg", sha256="bbbb")
+        # A done row whose path is also gone — must NOT be pruned.
+        done = _add(db, tmp_path / "gone" / "c.jpg", sha256="cccc", status="done")
+        # Dependents referencing the orphan.
+        db.conn.execute(
+            "INSERT INTO duplicates (file_id_a, file_id_b, dup_type) VALUES (?,?,'EXACT')",
+            (orphan, survivor),
+        )
+        db.conn.execute(
+            "INSERT INTO operations (file_id, op_type, source_path, status) "
+            "VALUES (?, 'MOVE', ?, 'planned')",
+            (orphan, str(tmp_path / "gone" / "a.jpg")),
+        )
+        db.conn.execute(
+            "INSERT INTO run_log (level, phase, file_id, path, message, logged_at) "
+            "VALUES ('WARN','relocate',?,?,'LOST x','2026-01-01T00:00:00+00:00')",
+            (orphan, str(tmp_path / "gone" / "a.jpg")),
+        )
+        db.commit()
+
+        orphan_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (orphan,)
+        ).fetchone()
+        done_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (done,)
+        ).fetchone()
+
+        pruned, kept_done = _prune_rows(db, [orphan_row, done_row], tmp_path / "report.txt")
+
+        assert pruned == 1 and kept_done == 1
+        # orphan + its dependents gone
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (orphan,)).fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM duplicates WHERE file_id_a=? OR file_id_b=?", (orphan, orphan)).fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM operations WHERE file_id=?", (orphan,)).fetchone()[0] == 0
+        # survivor + done row untouched
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (survivor,)).fetchone()[0] == 1
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (done,)).fetchone()[0] == 1
+        # audit file written with the pruned path
+        assert (tmp_path / "report.txt").read_text(encoding="utf-8").strip().endswith("a.jpg")
+
+
+def test_relocate_prune_removes_lost_default_off(tmp_path):
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    scan_root = tmp_path / "lib"
+    scan_root.mkdir(parents=True)
+    with Database(db_path) as db:
+        gone = _add(db, scan_root / "deleted.jpg", sha256="deadbeef")
+        db.commit()
+
+        # Default (prune off): row remains.
+        summary = relocate(db, [scan_root])
+        assert summary["lost"] == 1 and summary.get("pruned", 0) == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (gone,)).fetchone()[0] == 1
+
+        # prune=True: orphan row removed.
+        summary2 = relocate(db, [scan_root], prune=True)
+        assert summary2["pruned"] == 1
+        assert db.conn.execute("SELECT COUNT(*) FROM files WHERE file_id=?", (gone,)).fetchone()[0] == 0
+
+
+def test_cli_relocate_prune_flag():
+    import photo_organizer.__main__ as m
+    parser = m.build_parser()
+    args = parser.parse_args(["relocate", "--db", "x.db", "--prune"])
+    assert args.func is m.cmd_relocate and args.prune is True
+    args2 = parser.parse_args(["relocate", "--db", "x.db"])
+    assert args2.prune is False

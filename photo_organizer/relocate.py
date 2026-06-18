@@ -27,7 +27,7 @@ from .scanner import discover_files
 def find_stale_rows(db: Database) -> list:
     """Return non-error file rows whose recorded path no longer exists."""
     rows = db.conn.execute(
-        "SELECT file_id, path, filename, sha256 FROM files "
+        "SELECT file_id, path, filename, sha256, status FROM files "
         "WHERE sha256 IS NOT NULL AND status != 'error'"
     ).fetchall()
     return [r for r in rows if not os.path.exists(r["path"])]
@@ -62,15 +62,55 @@ def _match_rows_to_paths(rows: list, cands: list) -> list:
     return out
 
 
-def relocate(db: Database, scan_roots: list) -> dict:
+def _prune_rows(db: Database, lost_rows: list, report_path: Path) -> tuple[int, int]:
+    """Batch-delete orphaned (path-gone) rows + their dependents, FK-safe.
+
+    Rows with status 'done' are NOT pruned (a missing organized file is real
+    loss, not cleanup) — they are returned in the kept-done count and logged
+    ERROR by the caller. Returns (pruned_count, kept_done_count).
+
+    Prunable paths are written to `report_path` BEFORE deletion (durable audit
+    that survives the run_log rows being removed).
+    """
+    prunable = [r for r in lost_rows if r["status"] != "done"]
+    kept_done = [r for r in lost_rows if r["status"] == "done"]
+    if not prunable:
+        return 0, len(kept_done)
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "\n".join(r["path"] for r in prunable) + "\n", encoding="utf-8"
+    )
+
+    ids = [r["file_id"] for r in prunable]
+    db.conn.execute("CREATE TEMP TABLE IF NOT EXISTS _prune_ids (file_id INTEGER PRIMARY KEY)")
+    db.conn.execute("DELETE FROM _prune_ids")
+    db.conn.executemany("INSERT INTO _prune_ids(file_id) VALUES (?)", [(i,) for i in ids])
+    # Dependents first (FK ON, no cascade), then the files rows.
+    db.conn.execute(
+        "DELETE FROM duplicates WHERE file_id_a IN (SELECT file_id FROM _prune_ids) "
+        "OR file_id_b IN (SELECT file_id FROM _prune_ids) "
+        "OR keep_file_id IN (SELECT file_id FROM _prune_ids)"
+    )
+    db.conn.execute("DELETE FROM operations WHERE file_id IN (SELECT file_id FROM _prune_ids)")
+    db.conn.execute("DELETE FROM run_log WHERE file_id IN (SELECT file_id FROM _prune_ids)")
+    db.conn.execute("DELETE FROM files WHERE file_id IN (SELECT file_id FROM _prune_ids)")
+    db.conn.execute("DROP TABLE _prune_ids")
+    db.commit()
+    return len(prunable), len(kept_done)
+
+
+def relocate(db: Database, scan_roots: list, prune: bool = False) -> dict:
     """Re-point stale file rows to their moved location by sha256.
 
-    Returns {"stale": int, "relocated": int, "lost": int}. Updates only
-    files.path/mtime; logs unmatched (truly missing) rows as LOST.
+    With prune=True, rows still missing after relocation (and not status
+    'done') are deleted from the DB along with their dependents, so the DB
+    reflects the current library. Returns
+    {"stale", "relocated", "lost", "pruned"}.
     """
     stale = find_stale_rows(db)
     if not stale:
-        return {"stale": 0, "relocated": 0, "lost": 0}
+        return {"stale": 0, "relocated": 0, "lost": 0, "pruned": 0}
 
     known = {
         os.path.normcase(r["path"])
@@ -116,6 +156,26 @@ def relocate(db: Database, scan_roots: list) -> dict:
             relocated += 1
         lost.extend(r for r in rows if r["file_id"] not in matched_ids)
 
+    if prune:
+        report = db.path.parent / "_staging" / "pruned_paths.txt"
+        pruned, kept_done = _prune_rows(db, lost, report)
+        for r in lost:
+            if r["status"] == "done":
+                db.log(
+                    "ERROR",
+                    f"LOST 'done' file (organized file missing, NOT pruned): {r['path']}",
+                    phase="relocate", file_id=r["file_id"], path=r["path"],
+                )
+        db.log(
+            "INFO",
+            f"Pruned {pruned} orphaned row(s) (files removed from library); "
+            f"paths listed in {report}.",
+            phase="relocate",
+        )
+        db.commit()
+        return {"stale": len(stale), "relocated": relocated,
+                "lost": len(lost), "pruned": pruned}
+
     for r in lost:
         db.log(
             "WARN",
@@ -123,4 +183,5 @@ def relocate(db: Database, scan_roots: list) -> dict:
             phase="relocate", file_id=r["file_id"], path=r["path"],
         )
     db.commit()
-    return {"stale": len(stale), "relocated": relocated, "lost": len(lost)}
+    return {"stale": len(stale), "relocated": relocated,
+            "lost": len(lost), "pruned": 0}

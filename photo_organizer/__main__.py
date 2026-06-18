@@ -327,12 +327,14 @@ def cmd_relocate(args):
         print_error("relocate needs scan roots: --config with input_dirs, or a ROOT arg.")
         sys.exit(1)
     with Database(_db_path(args, cfg)) as db:
-        summary = relocate(db, scan_roots)
+        summary = relocate(db, scan_roots, prune=getattr(args, "prune", False))
     console.print(
         f"relocate: {summary['relocated']:,} re-pointed, "
-        f"{summary['lost']:,} LOST (of {summary['stale']:,} stale)."
+        f"{summary['pruned']:,} pruned, "
+        f"{summary['lost'] - summary['pruned']:,} still LOST "
+        f"(of {summary['stale']:,} stale)."
     )
-    sys.exit(0 if summary["lost"] == 0 else 1)
+    sys.exit(0 if (summary["lost"] - summary["pruned"]) == 0 else 1)
 
 
 def cmd_clone(args):
@@ -599,6 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-point files.path for manually-moved files via sha256 (no rebuild)",
     )
     p_reloc.add_argument("root", nargs="?", help="Optional scan root (else config input_dirs)")
+    p_reloc.add_argument(
+        "--prune", action="store_true",
+        help="Delete DB rows whose file was removed from the library (path gone, "
+             "not found in scan roots). Keeps 'done' rows. Writes pruned paths to "
+             "_staging/pruned_paths.txt.",
+    )
     p_reloc.set_defaults(func=cmd_relocate)
 
     # clone — non-destructive incremental backup to another volume
