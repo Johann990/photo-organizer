@@ -27,6 +27,7 @@ from .db import Database
 from .progress import console, print_phase_header, print_success
 
 _MAX_POST_BYTES = 64 * 1024
+_MAX_BATCH_BYTES = 16 * 1024 * 1024
 _SAMPLE_LIMIT = 8  # max filenames shown per folder side
 
 
@@ -335,6 +336,7 @@ def _make_handler(state: FolderReviewState):
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send(200, _render_page(state))
+                return
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -347,8 +349,8 @@ def _make_handler(state: FolderReviewState):
                 self._send(403, b"forbidden", "text/plain")
                 return
             try:
-                length = min(int(self.headers.get("Content-Length", 0)),
-                             _MAX_POST_BYTES)
+                cap = _MAX_BATCH_BYTES if self.path == "/folder-decision-all" else _MAX_POST_BYTES
+                length = min(int(self.headers.get("Content-Length", 0)), cap)
                 payload = json.loads(self.rfile.read(length) or b"{}")
 
                 if self.path == "/folder-undecision":
