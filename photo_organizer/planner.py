@@ -213,9 +213,12 @@ def _resolve_date(
             return fname, "filename", "LOW"
         # 1 < gap <= 2 days: ambiguous → fall through to MEDIUM EXIF.
 
-    # 3b. EXIF absent/insane but a sane filename date exists → use it (LOW).
+    # 3b. EXIF absent/insane but a sane filename date exists → use it.
+    # For videos (which carry no EXIF to contradict), the filename timestamp IS
+    # the camera's capture date — trust it (MEDIUM), don't bury it at LOW.
     if not exif_sane and fname_sane:
-        return fname, "filename", "LOW"
+        conf = "MEDIUM" if row["file_type"] == "VIDEO" else "LOW"
+        return fname, "filename", conf
 
     # 4. Lone sane EXIF, no corroboration, no camera.
     if exif_sane:
@@ -253,21 +256,64 @@ def _parse_override_date(s: str | None) -> datetime | None:
         return None
 
 
-def _effective_date_with_override(row: Any, overrides: dict | None) -> tuple[datetime | None, bool]:
+def _sibling_date_hints(db: Database) -> dict[str, datetime]:
+    """For each source folder, a representative capture date taken from the
+    folder's confidently-dated NON-VIDEO photos (HIGH/MEDIUM). Used to date
+    videos in that folder that have no capture time of their own. Representative
+    date = the most common photo date in the folder (ties → earliest)."""
+    from collections import Counter, defaultdict
+
+    by_folder: dict[str, Counter] = defaultdict(Counter)
+    for r in db.conn.execute(
+        "SELECT path, datetime_original, date_confidence, file_type FROM files "
+        "WHERE file_type != 'VIDEO' AND status != 'error' "
+        "AND date_confidence IN ('HIGH','MEDIUM') AND datetime_original IS NOT NULL"
+    ):
+        dt = _parse_exif_dt(r["datetime_original"])
+        if dt is None:
+            continue
+        folder = str(PureWindowsPath(r["path"]).parent)
+        by_folder[folder][dt.date()] += 1
+    hints: dict[str, datetime] = {}
+    for folder, counter in by_folder.items():
+        # most common date; tie-break to the earliest date
+        best = min(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        hints[folder] = datetime(best.year, best.month, best.day)
+    return hints
+
+
+def _effective_date_with_override(
+    row: Any, overrides: dict | None, sibling_hints: dict | None = None
+) -> tuple[datetime | None, bool]:
     """Like _effective_date, but a folder-level date_override replaces the date
     ONLY for files whose date_confidence is LOW or NULL (never HIGH/MEDIUM — real
     or corroborated EXIF is trusted). Returns (date, used_mtime); an applied
-    override reports used_mtime=False (it's a manual date, not an mtime guess)."""
+    override reports used_mtime=False (it's a manual date, not an mtime guess).
+
+    When no override applies and the file is a VIDEO still at LOW/None
+    confidence (i.e. no good date of its own — a video with a trustworthy
+    filename date already became MEDIUM in `_resolve_date` and never reaches
+    here), borrow the representative capture date of confidently-dated sibling
+    photos in the same source folder (`sibling_hints`, see `_sibling_date_hints`).
+    """
     dt, used_mtime = _effective_date(row)
-    if not overrides:
+    if not overrides and not sibling_hints:
         return dt, used_mtime
     conf = row["date_confidence"]
     if conf in ("LOW", None):
-        ov = overrides.get(str(Path(row["path"]).parent))
-        if ov is not None and ov["date_override"]:
-            parsed = _parse_override_date(ov["date_override"])
-            if parsed is not None:
-                return parsed, False
+        parent = str(Path(row["path"]).parent)
+        # 1. explicit user folder date override (any file type) — highest priority.
+        if overrides:
+            ov = overrides.get(parent)
+            if ov is not None and ov["date_override"]:
+                parsed = _parse_override_date(ov["date_override"])
+                if parsed is not None:
+                    return parsed, False
+        # 2. videos with no good date of their own → borrow folder's photo date.
+        if sibling_hints and row["file_type"] == "VIDEO":
+            hint = sibling_hints.get(parent)
+            if hint is not None:
+                return hint, False
     return dt, used_mtime
 
 
@@ -469,7 +515,7 @@ MAX_EVENT_SPAN_DAYS = 30
 
 def _compute_event_groups(
     db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None,
-    overrides: dict | None = None,
+    overrides: dict | None = None, sibling_hints: dict | None = None,
 ) -> dict[str, dict]:
     """
     Group kept photos by their RESOLVED event folder (`_resolve_event_folder`,
@@ -511,7 +557,7 @@ def _compute_event_groups(
                 "RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC", "VIDEO",
             ):
                 continue  # UNKNOWN stays in place
-            dt, _used_mtime = _effective_date_with_override(row, overrides)
+            dt, _used_mtime = _effective_date_with_override(row, overrides, sibling_hints)
             if dt is None:
                 continue
             folder = _resolve_event_folder(Path(row["path"]), scan_roots)
@@ -890,6 +936,7 @@ def _build_target_path(
     event_groups: dict[str, dict] | None = None,
     scan_roots: list[Path] | None = None,
     overrides: dict | None = None,
+    sibling_hints: dict | None = None,
 ) -> Path:
     """
     Compute the reorganised destination path for a file to keep.
@@ -925,7 +972,7 @@ def _build_target_path(
     (it appends _conflict_N when a destination already exists).
     """
     ext = (row["extension"] or "jpg").upper()
-    dt, _ = _effective_date_with_override(row, overrides)  # EXIF date, else mtime/override fallback
+    dt, _ = _effective_date_with_override(row, overrides, sibling_hints)  # EXIF date, else mtime/override/sibling fallback
 
     # Folder-level event-name override: non-empty event_name on the file's
     # immediate source parent folder wins over the auto-resolved label.
@@ -1130,6 +1177,11 @@ def plan(db: Database, target_root: Path, force: bool = False,
     # event grouping and target-path building.
     folder_overrides = db.get_folder_overrides()
 
+    # Per-folder representative photo date (V2): lets a date-less video borrow
+    # the capture date of confidently-dated sibling photos in its own source
+    # folder, instead of falling to an unreliable mtime.
+    sibling_hints = _sibling_date_hints(db)
+
     # ── 1. Identify files to stage-delete ────────────────────────────────────
     stage_ids: set[int] = set()
 
@@ -1264,6 +1316,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
     with console.status("Measuring event date spans…"):
         event_groups = _compute_event_groups(
             db, stage_ids, scan_roots, overrides=folder_overrides,
+            sibling_hints=sibling_hints,
         )
         db.commit()
 
@@ -1293,6 +1346,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 target = _build_target_path(
                     row, target_root, known_cameras, counters, event_groups,
                     scan_roots, overrides=folder_overrides,
+                    sibling_hints=sibling_hints,
                 )
                 ops.append({
                     "file_id": fid,

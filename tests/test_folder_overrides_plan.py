@@ -4,7 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from photo_organizer.db import Database
-from photo_organizer.planner import _build_target_path, plan
+from photo_organizer.planner import (
+    _build_target_path,
+    _resolve_date,
+    _sibling_date_hints,
+    plan,
+)
 
 
 def _add_file(
@@ -328,3 +333,214 @@ def test_event_override_subject_collection(tmp_path):
     )
     # override label "愷成長" wins over the auto subject label "愷"
     assert str(Path("愷成長") / "2012") in str(result)
+
+
+# ---------------------------------------------------------------------------
+# V2: trust video filename dates + borrow sibling-photo date
+# ---------------------------------------------------------------------------
+
+def test_video_filename_date_is_medium(tmp_path):
+    # A VIDEO with no EXIF but a sane filename date is the camera's own
+    # capture timestamp (videos carry no EXIF to contradict it) → MEDIUM,
+    # not LOW. mtime is in a different year and must NOT win.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\Camera\Clips"
+        fid = _add_file(
+            db, folder + r"\VID_20120908_143000.mp4",
+            file_type="VIDEO",
+            datetime_original=None,
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (fid,)
+        ).fetchone()
+
+    dt, source, confidence = _resolve_date(row)
+    assert source == "filename"
+    assert confidence == "MEDIUM"
+    assert dt.date().isoformat() == "2012-09-08"
+
+
+def test_photo_filename_date_still_low(tmp_path):
+    # Same situation but for a photo — filename-only dates stay LOW; photo
+    # behavior must be unchanged by the video-specific rung 3b branch.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\Camera\Clips"
+        fid = _add_file(
+            db, folder + r"\IMG_20120908_143000.jpg",
+            file_type="CAMERA_JPEG",
+            datetime_original=None,
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (fid,)
+        ).fetchone()
+
+    dt, source, confidence = _resolve_date(row)
+    assert source == "filename"
+    assert confidence == "LOW"
+    assert dt.date().isoformat() == "2012-09-08"
+
+
+def test_video_borrows_sibling_photo_date(tmp_path):
+    # A folder with a confidently-dated (HIGH) photo and a date-less video
+    # (no filename date either) → the video borrows the folder's photo date.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        video_id = _add_file(
+            db, folder + r"\MOV001.mov",
+            file_type="VIDEO",
+            datetime_original=None, date_confidence="LOW",
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        video_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (video_id,)
+        ).fetchone()
+        hints = _sibling_date_hints(db)
+
+    result = _build_target_path(
+        video_row, target, known_cameras=set(), counters={}, event_groups={},
+        sibling_hints=hints,
+    )
+    assert "2012" in str(result)
+    assert "2023" not in str(result)
+
+
+def test_video_no_sibling_keeps_own_date(tmp_path):
+    # A video-only folder (no photos) has no sibling hint → the video keeps
+    # its own (mtime) date.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Camera\VideosOnly"
+        video_id = _add_file(
+            db, folder + r"\MOV002.mov",
+            file_type="VIDEO",
+            datetime_original=None, date_confidence="LOW",
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        video_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (video_id,)
+        ).fetchone()
+        hints = _sibling_date_hints(db)
+
+    assert str(Path(folder)) not in hints
+
+    result = _build_target_path(
+        video_row, target, known_cameras=set(), counters={}, event_groups={},
+        sibling_hints=hints,
+    )
+    assert "2023" in str(result)
+
+
+def test_override_beats_sibling(tmp_path):
+    # A folder has both confident photos (2012) AND a user date_override
+    # (2015-04-02). The explicit override wins over the sibling-photo borrow.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        video_id = _add_file(
+            db, folder + r"\MOV001.mov",
+            file_type="VIDEO",
+            datetime_original=None, date_confidence="LOW",
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        _set_override(db, folder, date_override="2015-04-02")
+        video_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (video_id,)
+        ).fetchone()
+        overrides = db.get_folder_overrides()
+        hints = _sibling_date_hints(db)
+
+    result = _build_target_path(
+        video_row, target, known_cameras=set(), counters={}, event_groups={},
+        overrides=overrides, sibling_hints=hints,
+    )
+    assert "2015" in str(result)
+    assert "2012" not in str(result)
+    assert "2023" not in str(result)
+
+
+def test_sibling_does_not_touch_photos(tmp_path):
+    # Sibling-photo borrowing applies ONLY to videos. A LOW-confidence photo
+    # in a folder with other confident photos must keep its own resolved date.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        low_photo_id = _add_file(
+            db, folder + r"\photo002.jpg",
+            file_type="CAMERA_JPEG",
+            datetime_original="2023:06:15 10:00:00", date_confidence="LOW",
+            mtime="2023-06-15T10:00:00+00:00",
+        )
+        low_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (low_photo_id,)
+        ).fetchone()
+        hints = _sibling_date_hints(db)
+
+    baseline = _build_target_path(
+        low_row, target, known_cameras=set(), counters={}, event_groups={},
+    )
+    result = _build_target_path(
+        low_row, target, known_cameras=set(), counters={}, event_groups={},
+        sibling_hints=hints,
+    )
+    # sibling hints exist for this folder (the 2012 HIGH photo) but must not
+    # be applied to a photo — only videos borrow.
+    assert str(Path(folder)) in hints
+    assert result == baseline
+    assert "2023" in str(result)
+
+
+def test_plan_video_date_end_to_end(tmp_path):
+    # Full plan(): a folder with confident 2012 photos plus an mtime-2023
+    # video → the video's MOVE op target lands in 2012, not 2023.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        _add_file(
+            db, folder + r"\MOV001.mov",
+            file_type="VIDEO",
+            datetime_original=None,
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+
+        plan(db, target, assume_yes=True)
+
+        op = db.conn.execute(
+            "SELECT target_path FROM operations WHERE op_type='MOVE' "
+            "AND target_path LIKE '%Videos%'"
+        ).fetchone()
+        assert op is not None
+        target_path = op["target_path"]
+
+    assert "Videos" in target_path
+    assert "2012" in target_path
+    assert "2023" not in target_path
