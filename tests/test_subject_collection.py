@@ -77,9 +77,12 @@ def test_video_subject_collection_2010_2012(tmp_path):
         t2 = _build_target_path(_row(db, v2), target, set(), {}, groups)
         t3 = _build_target_path(_row(db, v3), target, set(), {}, groups)
 
-        assert t1.parent == target / "Videos" / "愷_1_2_歲_videos" / "2010"
-        assert t2.parent == target / "Videos" / "愷_1_2_歲_videos" / "2011"
-        assert t3.parent == target / "Videos" / "愷_1_2_歲_videos" / "2012"
+        # V3: videos co-locate inside the event/subject folder's own Videos/
+        # subfolder (base defaults to "Others" — no event_base map passed here,
+        # and no known camera).
+        assert t1.parent == target / "Others" / "愷_1_2_歲_videos" / "2010" / "Videos"
+        assert t2.parent == target / "Others" / "愷_1_2_歲_videos" / "2011" / "Videos"
+        assert t3.parent == target / "Others" / "愷_1_2_歲_videos" / "2012" / "Videos"
 
 
 def test_mtime_only_photo_now_enters_grouping_regression(tmp_path):
@@ -143,10 +146,11 @@ def test_video_event_kind_unaffected_existing_path(tmp_path):
         key = str(folder)
         assert groups[key]["kind"] == "event"
 
-        # No event_groups passed → must match the ORIGINAL flat layout exactly.
+        # V3: no event_groups passed → falls to the single-day folder shape,
+        # but still co-locates under the resolved event folder's Videos/.
         t1 = _build_target_path(_row(db, v1), target, set(), {})
-        assert t1.parent == target / "Videos" / "2015"
-        assert t1.name.startswith("2015-06-01_Wedding_")
+        assert t1.parent == target / "Others" / "2015" / "2015-06-01_Wedding" / "Videos"
+        assert t1.name.startswith("2015-06-01_")
 
         # Unresolved/no-group video (no datetime at all) → Videos/NoDate/.
         none_id = _add_file(db, tmp_path / "src" / "Misc" / "x.mp4",
@@ -155,7 +159,10 @@ def test_video_event_kind_unaffected_existing_path(tmp_path):
         assert t_none.parent == target / "Videos" / "NoDate"
 
 
-def test_video_subject_nodate_keeps_label(tmp_path):
+def test_video_subject_nodate_falls_to_standalone_nodate(tmp_path):
+    # V3: a video with NO date of its own can't co-locate (no date → no event
+    # subdir to place it in), even when siblings establish the folder as a
+    # subject collection — it falls to the standalone Videos/NoDate/ tree.
     db_path = tmp_path / ".photo_organizer" / "library.db"
     target = tmp_path / "Library"
     folder = tmp_path / "src" / "2010-2012 愷 1~2 歲 videos"
@@ -175,7 +182,7 @@ def test_video_subject_nodate_keeps_label(tmp_path):
         assert groups[key]["kind"] == "subject"
 
         t_nodate = _build_target_path(_row(db, v_nodate), target, set(), {}, groups)
-        assert t_nodate.parent == target / "Videos" / "愷_1_2_歲_videos" / "NoDate"
+        assert t_nodate.parent == target / "Videos" / "NoDate"
         assert v1 and v2  # siblings exist, just asserting setup sanity
 
 

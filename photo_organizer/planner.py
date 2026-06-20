@@ -587,6 +587,30 @@ def _compute_event_groups(
     return groups
 
 
+def _event_base_map(db: Database, known_cameras: set[str],
+                    scan_roots: list[Path] | None = None) -> dict[str, str]:
+    """resolved_event_folder(str) -> 'Masters' if ANY photo in that event has a
+    known camera, else 'Others'. Used to co-locate videos under the same base as
+    the event's photos. Photos only (RAW/CAMERA_JPEG/DEV_JPEG/HEIC) decide base."""
+    base: dict[str, str] = {}
+    for batch in db.iter_files():
+        for row in batch:
+            if row["status"] == "error":
+                continue
+            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
+                continue
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            if resolved is None:
+                continue
+            key = str(resolved)
+            model = (row["camera_model"] or "").lower()
+            if model and model in known_cameras:
+                base[key] = "Masters"          # any known-camera photo → Masters
+            else:
+                base.setdefault(key, "Others")  # don't downgrade an existing Masters
+    return base
+
+
 def keep_score(row: Any, known_cameras: set[str]) -> tuple:
     """Rank duplicate copies; the highest tuple is the one to KEEP.
 
@@ -928,6 +952,25 @@ def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
 # Target path builder
 # ---------------------------------------------------------------------------
 
+def _event_subdir(base: Path, dt: datetime, event: str, group: dict | None,
+                  ov_event: str = "") -> Path:
+    """The event FOLDER (directory, no filename) for a dated file — shared by
+    photos and videos so a video lands in the same event folder as its photos.
+    `event` is the final label (override-or-resolved); `ov_event` is the raw
+    folder override, which must still win over a subject group's own label."""
+    if group and group["kind"] == "subject":
+        folder = ov_event or group["label"] or event
+        return base / folder / dt.strftime("%Y")
+    if group and group["kind"] == "event":
+        start = group["start"]
+        stamp = f"{start.isoformat()}_{group['span']}d"
+        folder = f"{stamp}_{event}" if event else stamp
+        return base / start.strftime("%Y") / folder
+    day = dt.strftime("%Y-%m-%d")
+    folder = f"{day}_{event}" if event else day
+    return base / dt.strftime("%Y") / folder
+
+
 def _build_target_path(
     row: Any,
     target_root: Path,
@@ -937,6 +980,7 @@ def _build_target_path(
     scan_roots: list[Path] | None = None,
     overrides: dict | None = None,
     sibling_hints: dict | None = None,
+    event_base: dict | None = None,
 ) -> Path:
     """
     Compute the reorganised destination path for a file to keep.
@@ -959,14 +1003,20 @@ def _build_target_path(
       The {event} segment is dropped when the folder does not resolve to a real
       name, leaving just {YYYY-MM-DD}/ (or {start-date}_{N}d/).  RAW+JPEG pairs
       keep the same stem naturally because original camera filenames are kept.
-    Videos (own layout — date only, parent folder as event/location):
-      Videos/{YYYY}/{YYYY-MM-DD}_{event}_{seq:04d}.EXT
-      Videos/NoDate/{event}_{seq:04d}.EXT  — no EXIF datetime
-      The {event} segment is dropped when the parent folder name is unusable.
-      Subject collection (resolved folder spans > MAX_EVENT_SPAN_DAYS days):
-        Videos/{label}/{YYYY}/{YYYY-MM-DD}_{seq:04d}.EXT
-        Videos/{label}/NoDate/video_{seq:04d}.EXT  — this file itself has no date
-        — same rationale as the photo branch: a recurring theme, not one outing.
+    Videos (V3 — CO-LOCATED with the event's photos, in a Videos/ subfolder of
+    the SAME event folder; base (Masters/Others) follows the event's photos
+    via `event_base`, not the video's own camera):
+      Single-day event:
+        {base}/{YYYY}/{YYYY-MM-DD}_{event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT
+      Multi-day event:
+        {base}/{startYYYY}/{start}_{N}d_{event}/Videos/{date}_{seq:04d}.EXT
+      Subject collection:
+        {base}/{event}/{YYYY}/Videos/{date}_{seq:04d}.EXT
+      No resolved event (camera-dump folder), but dated — base follows the
+      VIDEO's OWN camera (no event photos to inherit a base from):
+        {base}/{YYYY}/{YYYY-MM-DD}/Videos/{date}_{seq:04d}.EXT
+      NO date — can't co-locate without a date, standalone tree kept:
+        Videos/NoDate/video_{seq:04d}.EXT
 
     Filename collisions inside a folder are resolved by the executor
     (it appends _conflict_N when a destination already exists).
@@ -979,38 +1029,27 @@ def _build_target_path(
     _ov = (overrides or {}).get(str(Path(row["path"]).parent))
     _ov_event = _sanitize_event(_ov["event_name"]) if (_ov and _ov["event_name"]) else ""
 
-    # ── Videos: dedicated tree, date-only, event = source parent folder ──────
+    # ── Videos: co-locate with the event's photos (V3) ────────────────────────
     if row["file_type"] == "VIDEO":
         resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
         group = (event_groups or {}).get(str(resolved)) if resolved else None
+        event = _ov_event or (_sanitize_event(resolved.name) if resolved else "")
 
-        if group and group["kind"] == "subject":
-            # Mirrors the photo subject branch: a named folder spanning months/
-            # years is a recurring theme (child, pet, revisited place), not one
-            # outing — keep videos together under the label instead of scattering
-            # them into bare Videos/{YYYY}/.
-            label = _ov_event or group["label"] or _sanitize_event(Path(row["path"]).parent.name)
-            if dt is None:
-                subdir = target_root / "Videos" / label / "NoDate"
-                stem = "video"
-            else:
-                subdir = target_root / "Videos" / label / dt.strftime("%Y")
-                stem = dt.strftime("%Y-%m-%d")
-            key = (str(subdir), stem)
-            seq = counters.get(key, 0)
-            counters[key] = seq + 1
-            return subdir / f"{stem}_{seq:04d}.{ext}"
-
-        # ── original logic, unchanged: event / no-group / unresolved ─────────
-        event = _ov_event or _sanitize_event(Path(row["path"]).parent.name)
         if dt is None:
+            # No date → can't co-locate; keep the standalone NoDate tree.
             subdir = target_root / "Videos" / "NoDate"
-            date_part = ""
+            stem = "video"
         else:
-            subdir = target_root / "Videos" / dt.strftime("%Y")
-            date_part = dt.strftime("%Y-%m-%d")
-        parts = [p for p in (date_part, event) if p]
-        stem = "_".join(parts) if parts else "video"
+            if resolved is not None:
+                base_name = (event_base or {}).get(str(resolved), "Others")
+            else:
+                # No resolved event (camera-dump folder): base by the video's
+                # own camera, matching where that folder's no-event photos go.
+                model = (row["camera_model"] or "").lower()
+                base_name = "Masters" if (model and model in known_cameras) else "Others"
+            base = target_root / base_name
+            subdir = _event_subdir(base, dt, event, group, _ov_event) / "Videos"
+            stem = dt.strftime("%Y-%m-%d")
 
         key = (str(subdir), stem)
         seq = counters.get(key, 0)
@@ -1031,23 +1070,7 @@ def _build_target_path(
         model_lower = (row["camera_model"] or "").lower()
         in_known = bool(model_lower and model_lower in known_cameras)
         base = target_root / ("Masters" if in_known else "Others")
-
-        if group and group["kind"] == "subject":
-            # Long-span named collection: keep together, subdivide by year only.
-            # Event-name override wins over the auto-derived subject label too.
-            folder = _ov_event or group["label"] or event
-            subdir = base / folder / dt.strftime("%Y")
-        elif group and group["kind"] == "event":
-            # Multi-day event: whole event collapses into one start-year folder.
-            start = group["start"]
-            stamp = f"{start.isoformat()}_{group['span']}d"
-            folder = f"{stamp}_{event}" if event else stamp
-            subdir = base / start.strftime("%Y") / folder
-        else:
-            # Single-day event (or unresolved): per-day folder with the label.
-            day = dt.strftime("%Y-%m-%d")
-            folder = f"{day}_{event}" if event else day
-            subdir = base / dt.strftime("%Y") / folder
+        subdir = _event_subdir(base, dt, event, group, _ov_event)
 
     return subdir / row["filename"]
 
@@ -1320,6 +1343,11 @@ def plan(db: Database, target_root: Path, force: bool = False,
         )
         db.commit()
 
+    # Per-event base (Masters/Others), so a video co-locates under the SAME
+    # base as its event's photos (V3) instead of following its own camera.
+    with console.status("Mapping event folders to Masters/Others…"):
+        event_base = _event_base_map(db, known_cameras, scan_roots)
+
     for batch in db.iter_files():
         for row in batch:
             fid = row["file_id"]
@@ -1346,7 +1374,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 target = _build_target_path(
                     row, target_root, known_cameras, counters, event_groups,
                     scan_roots, overrides=folder_overrides,
-                    sibling_hints=sibling_hints,
+                    sibling_hints=sibling_hints, event_base=event_base,
                 )
                 ops.append({
                     "file_id": fid,

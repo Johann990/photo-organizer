@@ -94,8 +94,10 @@ def test_event_override_video(tmp_path):
         row, target, known_cameras=set(), counters={}, event_groups={},
         overrides=overrides,
     )
-    assert "Videos" in str(result)
-    assert "2012-09-08_上海_0000" in str(result)
+    # V3: video co-locates inside the event folder's own Videos/ subfolder
+    # (base defaults to "Others" — no event_base map / known camera here).
+    assert str(Path("2012-09-08_上海") / "Videos") in str(result)
+    assert "2012-09-08_0000" in str(result)
 
 
 def test_date_override_applies_to_low(tmp_path):
