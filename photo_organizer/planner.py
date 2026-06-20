@@ -942,7 +942,7 @@ def _build_target_path(
             # years is a recurring theme (child, pet, revisited place), not one
             # outing — keep videos together under the label instead of scattering
             # them into bare Videos/{YYYY}/.
-            label = group["label"] or _sanitize_event(Path(row["path"]).parent.name)
+            label = _ov_event or group["label"] or _sanitize_event(Path(row["path"]).parent.name)
             if dt is None:
                 subdir = target_root / "Videos" / label / "NoDate"
                 stem = "video"
@@ -987,7 +987,8 @@ def _build_target_path(
 
         if group and group["kind"] == "subject":
             # Long-span named collection: keep together, subdivide by year only.
-            folder = group["label"] or event
+            # Event-name override wins over the auto-derived subject label too.
+            folder = _ov_event or group["label"] or event
             subdir = base / folder / dt.strftime("%Y")
         elif group and group["kind"] == "event":
             # Multi-day event: whole event collapses into one start-year folder.

@@ -217,3 +217,114 @@ def test_plan_applies_override_end_to_end(tmp_path):
     assert "上海" in target_path
     assert "2015" in target_path
     assert "2023" not in target_path
+
+
+def test_malformed_date_override_falls_back(tmp_path):
+    # A garbage date_override must not crash; the file keeps its real date.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Phone\Dump"
+        _add_file(
+            db, folder + r"\photo001.jpg",
+            datetime_original="2023:01:01 00:00:00", date_confidence="LOW",
+        )
+        _set_override(db, folder, date_override="2015-13-99")  # invalid
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE path=?", (folder + r"\photo001.jpg",)
+        ).fetchone()
+        overrides = db.get_folder_overrides()
+
+    result = _build_target_path(
+        row, target, known_cameras=set(), counters={}, event_groups={},
+        overrides=overrides,
+    )
+    # malformed override ignored → original LOW date (2023) kept, no crash
+    assert "2023" in str(result)
+    assert "2015" not in str(result)
+
+
+def test_event_name_sanitizing_to_empty_falls_back(tmp_path):
+    # An event_name that sanitizes to "" must fall back to the resolved label,
+    # never produce an empty/broken folder segment.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        _set_override(db, folder, event_name="2012")  # leading-year → stripped to ""
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE path=?", (folder + r"\IMG_0001.jpg",)
+        ).fetchone()
+        overrides = db.get_folder_overrides()
+        baseline = _build_target_path(
+            row, target, known_cameras=set(), counters={}, event_groups={},
+        )
+
+    result = _build_target_path(
+        row, target, known_cameras=set(), counters={}, event_groups={},
+        overrides=overrides,
+    )
+    # override sanitized to empty → identical to no override (resolved label kept)
+    assert result == baseline
+
+
+def test_override_on_folder_with_no_files_is_noop(tmp_path):
+    # An override row whose source_folder matches no file's parent is harmless.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        _set_override(db, r"D:\Some\Other\Folder", event_name="上海",
+                      date_override="2015-04-02")
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE path=?", (folder + r"\IMG_0001.jpg",)
+        ).fetchone()
+        overrides = db.get_folder_overrides()
+        baseline = _build_target_path(
+            row, target, known_cameras=set(), counters={}, event_groups={},
+        )
+
+    result = _build_target_path(
+        row, target, known_cameras=set(), counters={}, event_groups={},
+        overrides=overrides,
+    )
+    assert result == baseline
+
+
+def test_event_override_subject_collection(tmp_path):
+    # A >30-day named (subject) folder must also honor the event_name override
+    # (regression for the subject branch shadowing _ov_event).
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Kids\愷"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        _set_override(db, folder, event_name="愷成長")
+        row = db.conn.execute(
+            "SELECT * FROM files WHERE path=?", (folder + r"\IMG_0001.jpg",)
+        ).fetchone()
+        overrides = db.get_folder_overrides()
+
+    # Force this file's resolved folder into a subject group.
+    resolved = str(Path(folder))
+    event_groups = {resolved: {"kind": "subject", "label": "愷"}}
+    result = _build_target_path(
+        row, target, known_cameras=set(), counters={}, event_groups=event_groups,
+        overrides=overrides,
+    )
+    # override label "愷成長" wins over the auto subject label "愷"
+    assert str(Path("愷成長") / "2012") in str(result)
