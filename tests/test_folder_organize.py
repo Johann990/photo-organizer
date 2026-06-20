@@ -88,6 +88,48 @@ def test_candidate_includes_low_date_folder(tmp_path):
         assert folders[folder]["is_no_event"] is False
 
 
+def test_video_low_date_does_not_trigger_candidate(tmp_path):
+    # A well-named folder whose ONLY low-date file is a VIDEO must NOT appear:
+    # video mtime-only dates are a systemic planner concern, not a per-folder fix.
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\Photos\Kyoto"
+        _add_file(
+            db, folder + r"\MVI_0001.mov",
+            file_type="VIDEO", datetime_original=None, date_confidence="LOW",
+        )
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+        )
+        state = FolderOrganizeState(db)
+        folders = {f["folder"]: f for f in state.folders}
+        assert folder not in folders  # good name + only a video is LOW → skip
+
+
+def test_photo_low_date_still_triggers_despite_video(tmp_path):
+    # A non-video LOW file still flags the folder; the video LOW is not counted.
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\Photos\Kyoto"
+        _add_file(
+            db, folder + r"\MVI_0001.mov",
+            file_type="VIDEO", datetime_original=None, date_confidence="LOW",
+        )
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original=None, date_confidence="LOW",
+        )
+        state = FolderOrganizeState(db)
+        folders = {f["folder"]: f for f in state.folders}
+        assert folder in folders
+        assert folders[folder]["low_date_count"] == 1  # video LOW not counted
+
+
 def test_normal_folder_excluded(tmp_path):
     from photo_organizer.folderorganize import FolderOrganizeState
 

@@ -214,8 +214,16 @@ class FolderOrganizeState:
         for folder, rows in by_folder.items():
             name = PureWindowsPath(folder).name
             is_no_event = _is_unorganised_folder_name(name) or not _sanitize_event(name)
+            # Videos are excluded from the low-date trigger: ~96% of old videos
+            # carry no embedded capture time (mtime-only → LOW), which is a
+            # systemic video-date issue handled in the planner, not a per-folder
+            # thing to fix here. Counting them would flood this list with folders
+            # flagged solely by video mtime. A folder still appears if it has a
+            # non-video LOW/undated file, or an unusable (no-event) name.
             low_date_count = sum(
-                1 for r in rows if r["date_confidence"] in _LOW_CONFIDENCE
+                1 for r in rows
+                if r["date_confidence"] in _LOW_CONFIDENCE
+                and r["file_type"] != "VIDEO"
             )
 
             if not (is_no_event or low_date_count > 0):
