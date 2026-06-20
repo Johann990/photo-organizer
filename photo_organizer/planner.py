@@ -243,6 +243,34 @@ def _effective_date(row: Any) -> tuple[datetime | None, bool]:
     return dt, source == "mtime"
 
 
+def _parse_override_date(s: str | None) -> datetime | None:
+    """Parse a folder_overrides.date_override 'YYYY-MM-DD' string."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _effective_date_with_override(row: Any, overrides: dict | None) -> tuple[datetime | None, bool]:
+    """Like _effective_date, but a folder-level date_override replaces the date
+    ONLY for files whose date_confidence is LOW or NULL (never HIGH/MEDIUM — real
+    or corroborated EXIF is trusted). Returns (date, used_mtime); an applied
+    override reports used_mtime=False (it's a manual date, not an mtime guess)."""
+    dt, used_mtime = _effective_date(row)
+    if not overrides:
+        return dt, used_mtime
+    conf = row["date_confidence"]
+    if conf in ("LOW", None):
+        ov = overrides.get(str(Path(row["path"]).parent))
+        if ov is not None and ov["date_override"]:
+            parsed = _parse_override_date(ov["date_override"])
+            if parsed is not None:
+                return parsed, False
+    return dt, used_mtime
+
+
 def _sanitize_camera(model: str | None) -> str:
     """Return a filesystem-safe, truncated camera model string."""
     if not model:
@@ -440,7 +468,8 @@ MAX_EVENT_SPAN_DAYS = 30
 
 
 def _compute_event_groups(
-    db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None
+    db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None,
+    overrides: dict | None = None,
 ) -> dict[str, dict]:
     """
     Group kept photos by their RESOLVED event folder (`_resolve_event_folder`,
@@ -482,7 +511,7 @@ def _compute_event_groups(
                 "RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC", "VIDEO",
             ):
                 continue  # UNKNOWN stays in place
-            dt, _used_mtime = _effective_date(row)
+            dt, _used_mtime = _effective_date_with_override(row, overrides)
             if dt is None:
                 continue
             folder = _resolve_event_folder(Path(row["path"]), scan_roots)
@@ -860,6 +889,7 @@ def _build_target_path(
     counters: dict[tuple, int],
     event_groups: dict[str, dict] | None = None,
     scan_roots: list[Path] | None = None,
+    overrides: dict | None = None,
 ) -> Path:
     """
     Compute the reorganised destination path for a file to keep.
@@ -895,7 +925,12 @@ def _build_target_path(
     (it appends _conflict_N when a destination already exists).
     """
     ext = (row["extension"] or "jpg").upper()
-    dt, _ = _effective_date(row)  # EXIF date, else filesystem mtime fallback
+    dt, _ = _effective_date_with_override(row, overrides)  # EXIF date, else mtime/override fallback
+
+    # Folder-level event-name override: non-empty event_name on the file's
+    # immediate source parent folder wins over the auto-resolved label.
+    _ov = (overrides or {}).get(str(Path(row["path"]).parent))
+    _ov_event = _sanitize_event(_ov["event_name"]) if (_ov and _ov["event_name"]) else ""
 
     # ── Videos: dedicated tree, date-only, event = source parent folder ──────
     if row["file_type"] == "VIDEO":
@@ -920,7 +955,7 @@ def _build_target_path(
             return subdir / f"{stem}_{seq:04d}.{ext}"
 
         # ── original logic, unchanged: event / no-group / unresolved ─────────
-        event = _sanitize_event(Path(row["path"]).parent.name)
+        event = _ov_event or _sanitize_event(Path(row["path"]).parent.name)
         if dt is None:
             subdir = target_root / "Videos" / "NoDate"
             date_part = ""
@@ -939,7 +974,7 @@ def _build_target_path(
     # The label comes from the RESOLVED event folder (climbs past camera-dump /
     # date-divider subfolders); falls back to "" (no label) when unresolved.
     resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
-    event = _sanitize_event(resolved.name) if resolved else ""
+    event = _ov_event or (_sanitize_event(resolved.name) if resolved else "")
     group = (event_groups or {}).get(str(resolved)) if resolved else None
 
     if dt is None:
@@ -1089,6 +1124,11 @@ def plan(db: Database, target_root: Path, force: bool = False,
     with console.status("Auditing file dates (confidence + source)…"):
         date_audit = audit_dates(db)
 
+    # Per-folder event-name / date overrides (O2): user-set corrections keyed by
+    # a file's immediate source parent folder. Loaded once and threaded through
+    # event grouping and target-path building.
+    folder_overrides = db.get_folder_overrides()
+
     # ── 1. Identify files to stage-delete ────────────────────────────────────
     stage_ids: set[int] = set()
 
@@ -1221,7 +1261,9 @@ def plan(db: Database, target_root: Path, force: bool = False,
     # Pre-measure event/subject groups so each resolved folder maps to one
     # destination folder (multi-day event, or year-subdivided subject collection).
     with console.status("Measuring event date spans…"):
-        event_groups = _compute_event_groups(db, stage_ids, scan_roots)
+        event_groups = _compute_event_groups(
+            db, stage_ids, scan_roots, overrides=folder_overrides,
+        )
         db.commit()
 
     for batch in db.iter_files():
@@ -1249,7 +1291,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
                     mtime_fallback += 1
                 target = _build_target_path(
                     row, target_root, known_cameras, counters, event_groups,
-                    scan_roots,
+                    scan_roots, overrides=folder_overrides,
                 )
                 ops.append({
                     "file_id": fid,
