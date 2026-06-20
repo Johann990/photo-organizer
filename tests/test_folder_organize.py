@@ -2,8 +2,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from photo_organizer.db import Database
+
+
+def _write_jpeg(path):
+    from PIL import Image
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 48), (120, 60, 30)).save(p, "JPEG")
+    return str(p)
 
 
 def _add_file(
@@ -325,3 +334,117 @@ def test_cli_review_organize_wired():
     parser = m.build_parser()
     args = parser.parse_args(["review", "--organize", "--db", "x.db"])
     assert args.func is m.cmd_review and args.organize is True
+
+
+def test_sample_fids_for_image_folder(tmp_path):
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = str(tmp_path / "DCIM" / "100EOS5D")
+        jpg1 = _write_jpeg(folder + r"\IMG_0001.jpg")
+        jpg2 = _write_jpeg(folder + r"\IMG_0002.jpg")
+        _add_file(
+            db, jpg1,
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            file_type="CAMERA_JPEG",
+        )
+        _add_file(
+            db, jpg2,
+            datetime_original="2012:09:08 10:01:00", date_confidence="HIGH",
+            file_type="CAMERA_JPEG",
+        )
+        # A RAW and a VIDEO file in the same folder — must NOT show up as thumbs.
+        _add_file(
+            db, folder + r"\IMG_0003.CR2",
+            datetime_original="2012:09:08 10:02:00", date_confidence="HIGH",
+            file_type="RAW",
+        )
+        _add_file(
+            db, folder + r"\MVI_0004.mov",
+            datetime_original="2012:09:08 10:03:00", date_confidence="HIGH",
+            file_type="VIDEO",
+        )
+        state = FolderOrganizeState(db)
+        folders = {f["folder"]: f for f in state.folders}
+        assert folder in folders
+        sample_fids = folders[folder]["sample_fids"]
+        assert len(sample_fids) == 2
+        thumbnailable_paths = {jpg1, jpg2}
+        for fid in sample_fids:
+            assert state.meta[fid]["path"] in thumbnailable_paths
+
+
+def test_thumb_endpoint_serves_image(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import FolderOrganizeState, serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = str(tmp_path / "DCIM" / "100EOS5D")
+        jpg = _write_jpeg(folder + r"\IMG_0001.jpg")
+        _add_file(
+            db, jpg,
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            file_type="CAMERA_JPEG",
+        )
+        state = FolderOrganizeState(db)
+        folders = {f["folder"]: f for f in state.folders}
+        fid = folders[folder]["sample_fids"][0]
+
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/thumb/{fid}")
+            assert resp.status == 200
+            assert resp.headers.get("Content-Type") == "image/jpeg"
+            body = resp.read()
+            assert body[:2] == b"\xff\xd8"
+        finally:
+            httpd.shutdown()
+
+
+def test_thumb_unknown_fid_404(tmp_path):
+    import urllib.error
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\DCIM\100EOS5D"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+        )
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/thumb/999999")
+                assert False, "expected HTTPError"
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404
+        finally:
+            httpd.shutdown()
+
+
+def test_get_page_has_thumb_imgs(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = str(tmp_path / "DCIM" / "100EOS5D")
+        jpg = _write_jpeg(folder + r"\IMG_0001.jpg")
+        _add_file(
+            db, jpg,
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+            file_type="CAMERA_JPEG",
+        )
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+            body = urllib.request.urlopen(url).read().decode()
+            assert 'src="/thumb/' in body
+        finally:
+            httpd.shutdown()

@@ -8,8 +8,9 @@ are written to `folder_overrides` (keyed by the file's IMMEDIATE PARENT
 folder — same key `plan` looks up) and never auto-applied to files here;
 `plan` (O2) is what actually consults them.
 
-O3a is the functional tool WITHOUT thumbnails — O3b adds those using the
-`self.meta` map already populated below.
+O3b adds a contact-sheet thumbnail row per candidate folder, reusing
+`webreview.ThumbCache` (same lazy-generate-and-cache-by-file_id scheme as the
+near-dupe review UI) keyed off `self.meta` already populated below.
 
 Decision seam: POST /folder-override → db.set_folder_override().
 """
@@ -28,10 +29,14 @@ from pathlib import PureWindowsPath
 from .db import Database
 from .planner import _is_unorganised_folder_name, _parse_exif_dt, _sanitize_event
 from .progress import console, print_phase_header, print_success
+from .webreview import ThumbCache
 
 _MAX_POST_BYTES = 64 * 1024
 _MAX_BATCH_BYTES = 16 * 1024 * 1024
 _SAMPLE_LIMIT = 8  # max filenames shown per candidate folder
+_THUMB_SAMPLE_LIMIT = 6  # max thumbnails shown per candidate folder
+# Pillow-openable image types (RAW/.CR2/.ARW and VIDEO are not reliably openable).
+_THUMBNAILABLE_TYPES = frozenset(("CAMERA_JPEG", "DEV_JPEG", "HEIC"))
 
 _LOW_CONFIDENCE = ("LOW", None)
 _CONFIDENT = ("HIGH", "MEDIUM")
@@ -64,6 +69,9 @@ h1 { font-size: 1.25rem; margin: 0 0 .2rem; }
 .chead .flag { background: #3d2a14; color: #e3a85b; border-radius: 6px;
                padding: .1rem .5rem; font-size: .76rem; }
 .stats { font-size: .78rem; color: #8b93a1; margin-bottom: .5rem; }
+.thumbs { display: flex; flex-wrap: wrap; gap: .35rem; margin: .3rem 0 .5rem; }
+.thumb { height: 96px; width: auto; border-radius: 6px; border: 1px solid #2b2f38;
+         object-fit: cover; }
 .samples { margin: .3rem 0 .6rem 0; padding: 0 0 0 1rem; font-size: .72rem; color: #7d8694; }
 .samples li { list-style: disc; margin: .1rem 0; }
 .inputs { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: .4rem; }
@@ -224,6 +232,14 @@ class FolderOrganizeState:
 
             samples = [r["filename"] for r in rows[:_SAMPLE_LIMIT]]
 
+            # Sample file_ids of Pillow-openable images for thumbnail rendering.
+            # RAW/.CR2/.ARW and VIDEO stay out of sample_fids (not reliably
+            # openable) but remain in the filename `samples` list above.
+            sample_fids = [
+                r["file_id"] for r in rows
+                if r["file_type"] in _THUMBNAILABLE_TYPES
+            ][:_THUMB_SAMPLE_LIMIT]
+
             for r in rows:
                 meta[r["file_id"]] = {"path": r["path"]}
 
@@ -237,6 +253,7 @@ class FolderOrganizeState:
                 "date_lo": date_lo,
                 "date_hi": date_hi,
                 "samples": samples,
+                "sample_fids": sample_fids,
                 "override": {
                     "event_name": ov["event_name"] if ov else None,
                     "date_override": ov["date_override"] if ov else None,
@@ -246,6 +263,7 @@ class FolderOrganizeState:
         self.db = db
         self.meta = meta
         self.folders = folders
+        self.thumbs = ThumbCache(db.path.parent / "_staging" / ".thumbs")
         self.lock = threading.Lock()
         self.groups: list[dict] = self._build_groups()
 
@@ -295,6 +313,12 @@ def _card_html(row: dict) -> str:
     else:
         date_range = "no confident date"
 
+    thumb_items = "".join(
+        f'<img class="thumb" loading="lazy" src="/thumb/{fid}" alt="">'
+        for fid in row["sample_fids"]
+    )
+    thumbs_html = f'<div class="thumbs">{thumb_items}</div>' if thumb_items else ""
+
     items = "".join(f"<li>{html.escape(f)}</li>" for f in row["samples"])
     sample_html = f'<ul class="samples">{items}</ul>' if items else ""
 
@@ -312,6 +336,7 @@ def _card_html(row: dict) -> str:
         f'{flags_html}'
         f'</div>'
         f'<div class="stats">date range: {date_range}</div>'
+        f'{thumbs_html}'
         f'{sample_html}'
         f'<div class="inputs">'
         f'<label>Event name</label>'
@@ -400,8 +425,15 @@ def _make_handler(state: FolderOrganizeState):
             if self.path in ("/", "/index.html"):
                 self._send(200, _render_page(state))
                 return
-            else:
-                self._send(404, b"not found", "text/plain")
+            if self.path.startswith("/thumb/"):
+                try:
+                    fid = int(self.path.rsplit("/", 1)[-1].split(".")[0])
+                    tp, _ = state.thumbs.ensure(fid, state.meta[fid]["path"])
+                    self._send(200, tp.read_bytes(), "image/jpeg")
+                except (KeyError, ValueError, OSError):
+                    self._send(404, b"not found", "text/plain")
+                return
+            self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
             if self.path not in _VALID_PATHS:
