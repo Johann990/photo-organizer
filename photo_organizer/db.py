@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS folder_overlaps (
     UNIQUE(folder_a, folder_b)
 );
 
+CREATE TABLE IF NOT EXISTS folder_overrides (
+    source_folder TEXT PRIMARY KEY,   -- absolute Windows path of the source parent folder
+    event_name    TEXT,               -- override event label (NULL = no override)
+    date_override TEXT,               -- override date 'YYYY-MM-DD' (NULL = no override)
+    note          TEXT,
+    updated_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS operations (
     op_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id      INTEGER NOT NULL REFERENCES files(file_id),
@@ -188,7 +196,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
 # SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
 # guard, not the migration mechanism: migrations stay idempotent ALTERs.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class SchemaVersionError(RuntimeError):
@@ -747,6 +755,37 @@ class Database:
         )
         if self.conn.execute("SELECT changes()").fetchone()[0] == 0:
             raise KeyError(f"overlap_id {overlap_id} not found in folder_overlaps")
+
+    # ---- folder_overrides --------------------------------------------------
+
+    def set_folder_override(self, source_folder: str, *, event_name=None,
+                            date_override=None, note=None, updated_at: str) -> None:
+        """Upsert a per-folder override. event_name/date_override = None clears
+        that column for the folder. Stores the full row keyed by source_folder."""
+        self.conn.execute(
+            "INSERT INTO folder_overrides "
+            "(source_folder, event_name, date_override, note, updated_at) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(source_folder) DO UPDATE SET "
+            "event_name=excluded.event_name, date_override=excluded.date_override, "
+            "note=excluded.note, updated_at=excluded.updated_at",
+            (source_folder, event_name, date_override, note, updated_at),
+        )
+
+    def clear_folder_override(self, source_folder: str) -> None:
+        """Remove a folder's override row. Raises KeyError if none existed."""
+        self.conn.execute(
+            "DELETE FROM folder_overrides WHERE source_folder=?", (source_folder,)
+        )
+        if self.conn.execute("SELECT changes()").fetchone()[0] == 0:
+            raise KeyError(f"no folder_override for {source_folder!r}")
+
+    def get_folder_overrides(self) -> dict:
+        """Return {source_folder: sqlite3.Row} for every override (event or date)."""
+        return {
+            r["source_folder"]: r
+            for r in self.conn.execute("SELECT * FROM folder_overrides")
+        }
 
     # ---- run_log -----------------------------------------------------------
 
