@@ -415,6 +415,38 @@ def test_video_borrows_sibling_photo_date(tmp_path):
     assert "2023" not in str(result)
 
 
+def test_video_filename_beats_sibling(tmp_path):
+    # A video with its OWN filename date (→ MEDIUM via rung 3b) must keep that
+    # date and NOT borrow from siblings, even when confident sibling photos
+    # exist with a different date. Own evidence beats borrowed inference.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    target = tmp_path / "Organised"
+    with Database(db_path) as db:
+        folder = r"D:\Trips\Kyoto"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2015:04:02 10:00:00", date_confidence="HIGH",
+            camera_model="Canon EOS 5D",
+        )
+        video_id = _add_file(
+            db, folder + r"\VID_20120908_143000.mp4",
+            file_type="VIDEO",
+            datetime_original=None, date_confidence="MEDIUM",  # as audit sets it
+            mtime="2023-01-01T00:00:00+00:00",
+        )
+        video_row = db.conn.execute(
+            "SELECT * FROM files WHERE file_id=?", (video_id,)
+        ).fetchone()
+        hints = _sibling_date_hints(db)
+
+    result = _build_target_path(
+        video_row, target, known_cameras=set(), counters={}, event_groups={},
+        sibling_hints=hints,
+    )
+    assert "2012" in str(result)       # own filename date wins
+    assert "2015" not in str(result)   # not the sibling photo date
+
+
 def test_video_no_sibling_keeps_own_date(tmp_path):
     # A video-only folder (no photos) has no sibling hint → the video keeps
     # its own (mtime) date.
