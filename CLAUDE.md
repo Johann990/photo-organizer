@@ -53,11 +53,15 @@
 ## 影片支援 / Video support
 
 - **掃描 / Scan**：mp4/mov/m4v/avi/mkv/wmv/flv/webm/mts/m2ts/3gp/3g2/mpg/mpeg → `file_type = VIDEO`
-- **整理目錄（與照片分開）/ Output tree (separate from photos)**：
-  `{target}/Videos/{YYYY}/{YYYY-MM-DD}_{event}_{seq:04d}.EXT`
-  - `{event}` = 來源檔案的**父資料夾名**（清理後）；取不到時省略該段
-    / sanitized parent folder name; omitted when unusable
-  - 無 EXIF 日期 → `Videos/NoDate/` / no date → `Videos/NoDate/`
+- **整理目錄（與事件共置）/ Output tree (co-located with the event)**：影片放進**該事件資料夾的 `Videos/` 子夾**,和同一場合的照片在一起(不再丟到全域 `Videos/` 樹散落)。
+  / a video lands in a `Videos/` subfolder of the SAME event folder its photos use, instead of a flat global tree.
+  - 單日 / single-day：`{base}/{YYYY}/{YYYY-MM-DD}_{event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT`
+  - 多日 / multi-day：`{base}/{起始YYYY}/{起始}_{N}d_{event}/Videos/{日期}_{seq:04d}.EXT`
+  - 主題 / subject collection：`{base}/{event}/{YYYY}/Videos/{日期}_{seq:04d}.EXT`
+  - 無事件名的相機傾倒夾(resolve 不到事件)但有日期 → `{base}/{YYYY}/{YYYY-MM-DD}/Videos/...`
+  - **`base`(Masters vs Others)= 規則 C**:該事件只要有**任一張已知相機照片** → `Masters`,否則 `Others`(`_event_base_map`);resolve 不到事件時改依**影片自身相機**。如此影片永遠和該事件「大宗」照片同一棵樹。/ base follows the event's photos (any known-camera photo → Masters, else Others); falls back to the video's own camera when no event resolves.
+  - 無日期 / no date → 維持獨立 `Videos/NoDate/video_{seq:04d}.EXT`(無日期無法共置)。
+- **影片日期 / Video date**:96% 老影片無嵌入拍攝時間。優先序 **人工 override > 影片檔名日期(自身,視為 MEDIUM)> 借同夾照片日期(`_sibling_date_hints`)> mtime**。借日期只填仍 LOW/無日期的影片,HIGH/MEDIUM 真日期永不被覆寫。/ filename date trusted (MEDIUM), else borrow the folder's photo date; never overrides HIGH/MEDIUM.
 - **日期來源 / Date source**：優先 `CreationDate`（Apple，含時區）→ `CreateDate` → `MediaCreateDate`
 - **中繼資料 / Metadata**：`duration_seconds` / `video_codec` / `frame_rate`（report 會顯示）
 - **去重 / Dedup**：影片只做 **exact SHA-256**；near-dupe（pHash）為影像專用，影片不適用
