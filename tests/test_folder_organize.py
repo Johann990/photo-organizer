@@ -180,6 +180,48 @@ def test_post_override_saves(tmp_path):
             overrides = db.get_folder_overrides()
             assert folder in overrides
             assert overrides[folder]["event_name"] == "上海"
+            # KEY CONTRACT (load-bearing with plan): the saved override key must
+            # equal the file's IMMEDIATE parent dir — not a resolved ancestor.
+            from pathlib import PureWindowsPath
+            saved_key = next(iter(overrides))
+            assert saved_key == str(
+                PureWindowsPath(folder + r"\IMG_0001.jpg").parent
+            )
+        finally:
+            httpd.shutdown()
+
+
+def test_post_override_special_chars_roundtrip(tmp_path):
+    # A folder path with characters that need HTML/JS escaping must round-trip
+    # byte-exact from the data-attribute → POST → folder_overrides key, or the
+    # plan lookup (keyed on the exact parent string) silently misses.
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\DCIM\O'Brien & <co>"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="LOW",
+        )
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({
+                "source_folder": folder, "event_name": "派對",
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            overrides = db.get_folder_overrides()
+            assert folder in overrides
+            assert overrides[folder]["event_name"] == "派對"
         finally:
             httpd.shutdown()
 
