@@ -50,6 +50,25 @@ def test_upsert_overwrites(tmp_path):
         assert row["date_override"] == "2023-06-16"
 
 
+def test_upsert_clears_omitted_date(tmp_path):
+    # O2 relies on this: a second set_folder_override that omits date_override
+    # must null it out (full-row replace via excluded.*), not keep the old value.
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        db.set_folder_override(
+            "D:\\Photos\\Kyoto", event_name="Kyoto", date_override="2023-06-15",
+            updated_at=_now(),
+        )
+        db.commit()
+        db.set_folder_override(
+            "D:\\Photos\\Kyoto", event_name="Kyoto", updated_at=_now(),
+        )
+        db.commit()
+        row = db.get_folder_overrides()["D:\\Photos\\Kyoto"]
+        assert row["event_name"] == "Kyoto"
+        assert row["date_override"] is None
+
+
 def test_set_event_only(tmp_path):
     db_path = tmp_path / ".photo_organizer" / "library.db"
     with Database(db_path) as db:
