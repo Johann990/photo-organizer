@@ -385,6 +385,9 @@ def cmd_review(args):
         elif getattr(args, "folders", False):
             from .folderreview import serve as folder_serve
             folder_serve(db, port=getattr(args, "port", 0))
+        elif getattr(args, "organize", False):
+            from .folderorganize import serve as organize_serve
+            organize_serve(db, port=getattr(args, "port", 0))
         elif getattr(args, "web", False):
             from .webreview import serve
             serve(db, review_all=getattr(args, "all", False),
@@ -738,6 +741,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument(
         "--folders", action="store_true",
         help="Review twin-folder pairs (from folder-merge) instead of near-duplicate images",
+    )
+    p_review.add_argument(
+        "--organize", action="store_true",
+        help="Assign event names / dates to no-event or low-confidence-date folders "
+             "(writes folder_overrides consulted by plan)",
     )
     p_review.set_defaults(func=cmd_review)
 
