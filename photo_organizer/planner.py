@@ -13,7 +13,7 @@ to confirm before Phase 5 can run.
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -512,6 +512,13 @@ def _is_camera_original_name(filename: str | None) -> bool:
 # as "not a single outing" (e.g. a phone dump) and fall back to per-day folders.
 MAX_EVENT_SPAN_DAYS = 30
 
+# detect_per_day_events: max gap (days) between adjacent per-day subfolders for
+# them to still count as one roughly-consecutive outing.
+_EVENT_DAY_GAP = 3
+# detect_per_day_events: a subfolder must have >=90% of its confident-dated
+# photos on ONE calendar day to count as a "per-day" subfolder.
+_PER_DAY_DOMINANCE = 0.90
+
 
 def _compute_event_groups(
     db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None,
@@ -585,6 +592,73 @@ def _compute_event_groups(
             groups[key] = {"kind": "event", "start": dmin, "span": span}
         # span == 1 → single-day event, handled inline with the resolved label
     return groups
+
+
+def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) -> list[dict]:
+    """DB-only. Find event-root folders already organized into per-day subfolders:
+    >=2 photo subfolders, each >=_PER_DAY_DOMINANCE a single day, days spanning
+    >=2 and roughly consecutive (adjacent gap <= _EVENT_DAY_GAP), total span <=
+    MAX_EVENT_SPAN_DAYS. Returns [{event_folder, days:[date], span:int,
+    subfolders:[str]}], a suggestion list for review --organize (user opts in via
+    per_day_split). No disk reads."""
+    # Never treat a scan root itself as an event: serial/camera-dump subfolders
+    # sitting directly under a scan root resolve UP to the root, which would
+    # otherwise masquerade as a per-day event (event name = the root's name).
+    root_set = {str(Path(r)) for r in (scan_roots or [])}
+    sub_dates: dict[str, Counter] = defaultdict(Counter)
+    sub_parent: dict[str, str] = {}
+    for batch in db.iter_files():
+        for row in batch:
+            if row["status"] == "error":
+                continue
+            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
+                continue
+            if row["date_confidence"] not in ("HIGH", "MEDIUM"):
+                continue
+            dt = _parse_exif_dt(row["datetime_original"])
+            if dt is None:
+                continue
+            sub = str(Path(row["path"]).parent)
+            sub_dates[sub][dt.date()] += 1
+            if sub not in sub_parent:
+                resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+                sub_parent[sub] = str(resolved) if resolved else ""
+
+    by_event: dict[str, list[tuple[str, date]]] = defaultdict(list)
+    for sub, counter in sub_dates.items():
+        total = sum(counter.values())
+        # On a tie most_common picks insertion order; the winning day is not
+        # load-bearing — it only feeds the days-set/span, and a near-even split
+        # already fails the dominance gate below, so detection stays stable.
+        day, n = counter.most_common(1)[0]
+        if total == 0 or n / total < _PER_DAY_DOMINANCE:
+            continue  # subfolder not predominantly one day
+        root = sub_parent.get(sub, "")
+        if not root or root == sub or root in root_set:
+            continue  # no event root above this subfolder
+        by_event[root].append((sub, day))
+
+    out: list[dict] = []
+    for root, subs in by_event.items():
+        if len(subs) < 2:
+            continue
+        days = sorted({d for _, d in subs})
+        if len(days) < 2:
+            continue
+        span = (days[-1] - days[0]).days + 1
+        if span > MAX_EVENT_SPAN_DAYS:
+            continue
+        gaps = [(days[i + 1] - days[i]).days for i in range(len(days) - 1)]
+        if any(g > _EVENT_DAY_GAP for g in gaps):
+            continue
+        out.append({
+            "event_folder": root,
+            "days": days,
+            "span": span,
+            "subfolders": sorted(s for s, _ in subs),
+        })
+    out.sort(key=lambda c: -len(c["subfolders"]))
+    return out
 
 
 def _event_base_map(db: Database, known_cameras: set[str],
