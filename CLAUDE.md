@@ -35,13 +35,15 @@
 
 ## 照片整理目錄 / Photo output tree
 
-- 單日活動 / single-day：`{target}/Masters|Others/{YYYY}/{YYYY-MM-DD}_{event}/{原始檔名}`
-- 多天活動 / multi-day（2–30 天）：`.../{YYYY}/{起始日}_{N}d_{event}/{原始檔名}`
+- 單日活動 / single-day：`{target}/Masters|Others/{YYYY}/{YYYY-MM-DD} {event}/{原始檔名}`
+- 多天活動 / multi-day（2–30 天）：`.../{YYYY}/{起始日}({N}d) {event}/{原始檔名}`
   - 同一來源資料夾橫跨多天 → 整個活動收進**一個**資料夾，年份用起始日
-    / whole event in one folder, named by start date + day count (e.g. `2023-06-15_3d_Kyoto`)
-  - 跨度 > 30 天（多半是手機傾倒）→ 退回每日制 `{YYYY-MM-DD}_{event}/` 並寫 WARN 到 run_log
+    / whole event in one folder, named by start date + day count (e.g. `2023-06-15(3d) Kyoto`)
+  - **依日分夾 / per-day split**(opt-in,經 `review --organize` 勾選 `folder_overrides.per_day_split`):多天活動可再依**每張照片自己的日期**分進 `{mmdd}/` 子夾 → `.../{起始日}({N}d) {event}/{mmdd}/{原始檔名}`(如 `2005-08-06(9d) 蒙古/0808/`)。`{mmdd}` 用各檔自身有效日期 → 放錯日的離群檔會自動歸位。預設**不分**(維持平鋪)。
+    / a multi-day event can opt into per-day `{mmdd}/` subfolders (by each file's own date); off by default.
+  - 跨度 > 30 天（多半是手機傾倒）→ 退回每日制 `{YYYY-MM-DD} {event}/` 並寫 WARN 到 run_log
   - 跨度由各來源資料夾內照片的 EXIF 最早/最晚日期自動計算 / span auto-computed from EXIF dates
-  - `{event}` = 來源父資料夾名（清理後）；取不到時省略 → `{YYYY-MM-DD}/` 或 `{起始日}_{N}d/`
+  - `{event}` = 來源父資料夾名（清理後）；取不到時省略 → `{YYYY-MM-DD}/` 或 `{起始日}({N}d)/`
   - **保留原始檔名**（不重命名）→ RAW+JPEG 自然同 stem / original filenames kept, pairs share stem
   - `Masters` = known_cameras 內的相機；`Others` = 其他；`NoDate/` = 連 mtime 退路都取不到日期
   - 同名碰撞由 executor 處理（加 `_conflict_N` 並寫 WARN 到 run_log）/ collisions logged + suffixed
@@ -55,8 +57,9 @@
 - **掃描 / Scan**：mp4/mov/m4v/avi/mkv/wmv/flv/webm/mts/m2ts/3gp/3g2/mpg/mpeg → `file_type = VIDEO`
 - **整理目錄（與事件共置）/ Output tree (co-located with the event)**：影片放進**該事件資料夾的 `Videos/` 子夾**,和同一場合的照片在一起(不再丟到全域 `Videos/` 樹散落)。
   / a video lands in a `Videos/` subfolder of the SAME event folder its photos use, instead of a flat global tree.
-  - 單日 / single-day：`{base}/{YYYY}/{YYYY-MM-DD}_{event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT`
-  - 多日 / multi-day：`{base}/{起始YYYY}/{起始}_{N}d_{event}/Videos/{日期}_{seq:04d}.EXT`
+  - 單日 / single-day：`{base}/{YYYY}/{YYYY-MM-DD} {event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT`
+  - 多日 / multi-day：`{base}/{起始YYYY}/{起始}({N}d) {event}/Videos/{日期}_{seq:04d}.EXT`
+  - 多日且 opt-in 依日分夾 / multi-day with per-day split：`{base}/{起始YYYY}/{起始}({N}d) {event}/{mmdd}/Videos/{日期}_{seq:04d}.EXT`(影片隨同事件落進對應 `{mmdd}/` 下的 `Videos/`)
   - 主題 / subject collection：`{base}/{event}/{YYYY}/Videos/{日期}_{seq:04d}.EXT`
   - 無事件名的相機傾倒夾(resolve 不到事件)但有日期 → `{base}/{YYYY}/{YYYY-MM-DD}/Videos/...`
   - **`base`(Masters vs Others)= 規則 C**:該事件只要有**任一張已知相機照片** → `Masters`,否則 `Others`(`_event_base_map`);resolve 不到事件時改依**影片自身相機**。如此影片永遠和該事件「大宗」照片同一棵樹。/ base follows the event's photos (any known-camera photo → Masters, else Others); falls back to the video's own camera when no event resolves.
@@ -182,6 +185,20 @@ python -m photo_organizer review --web --port 8765 --db C:\photos.db
   / resized/copy clusters pre-keep the highest resolution; burst clusters pre-keep every in-focus frame and pre-drop only the soft ones. Click to override; per-cluster "keep all".
 - **決策層不變 / Same decision seam**：`POST /decision` 仍走 `reviewer._record_decision`，只寫 `status='reviewed'` + `keep_file_id`；實際刪除一樣等 `plan` 建 `STAGE_DELETE`。TUI 審查完整保留，`--web` 只是多一個前端。
   / decisions still flow through the unchanged `_record_decision`; the TUI path is untouched.
+
+### 資料夾整理審查 / Folder-organize review（`review --organize`）
+
+```bat
+python -m photo_organizer review --organize --db C:\photos.db
+```
+- 另起一個本機網頁(同 `review --web` 的 stdlib 伺服器),針對**資料夾結構**做人工整理,把決策寫進 `folder_overrides` 表(不動 `files`、不建搬移)。`plan` 之後讀這些 override 落點。
+  / a local web page to curate FOLDER structure; writes decisions to `folder_overrides` (plan reads them later).
+- **無事件 / 低可信度日期資料夾**:列出名稱只是日期/流水號的相機傾倒夾,以及含 LOW 可信度日期照片的資料夾(影片的 LOW 日期不計入——那是 planner 的系統性問題,非單夾可修),讓你直接填**事件名 / 日期 override**(keyed by 檔案的**直接父夾**)。
+  / no-event & LOW-date folders get inline event-name / date overrides (keyed by the file's immediate parent).
+- **依日分夾候選 / Per-day-split candidates**:用 `detect_per_day_events` 偵測**已按日分夾的多日活動**(≥2 個子夾、每夾 ≥90% 同一天、日期連續且總跨度 ≤30 天),提供 `per_day_split` 勾選鈕(keyed by **事件根**)。勾選後 `plan` 會把該事件依日落進 `{mmdd}/`(見〈照片整理目錄〉)。
+  / detects already-day-organized multi-day events and offers a per_day_split toggle (keyed by the event root).
+- **手動拆夾提醒(唯讀)/ Manual-split reminder (read-only)**:列出**多日且日期分散**(至少一個相鄰日 gap > 3 天,可能混了不同活動)的平鋪資料夾,建議去**檔案總管**手動拆夾 → `relocate` → `plan`。連續行程(所有 gap ≤ 3 天)視為單一活動,平鋪即可,**不列入**。
+  / read-only list of SCATTERED multi-day folders (a >3-day gap → likely mixed occasions); split manually in Explorer then `relocate`. Contiguous trips are filed fine flat and are NOT flagged.
 
 ### 異地備份 / Clone — verified incremental backup to another volume（`clone`）
 
