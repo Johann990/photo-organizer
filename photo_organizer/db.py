@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS folder_overrides (
     event_name    TEXT,               -- override event label (NULL = no override)
     date_override TEXT,               -- override date 'YYYY-MM-DD' (NULL = no override)
     note          TEXT,
-    updated_at    TEXT
+    updated_at    TEXT,
+    per_day_split INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -196,7 +197,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
 # SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
 # guard, not the migration mechanism: migrations stay idempotent ALTERs.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class SchemaVersionError(RuntimeError):
@@ -242,6 +243,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
     _migrate_filetype_check(conn)
     _migrate_operations_check(conn)
+    _migrate_folder_overrides_per_day_split(conn)
 
 
 def _migrate_operations_check(conn: sqlite3.Connection) -> None:
@@ -285,6 +287,17 @@ def _migrate_operations_check(conn: sqlite3.Connection) -> None:
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_folder_overrides_per_day_split(conn: sqlite3.Connection) -> None:
+    """Add folder_overrides.per_day_split to an existing DB. Idempotent: only
+    ALTERs when the column is absent (a fresh DB already has it via SCHEMA_SQL)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(folder_overrides)").fetchall()]
+    if "per_day_split" not in cols:
+        conn.execute(
+            "ALTER TABLE folder_overrides ADD COLUMN per_day_split INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
@@ -759,17 +772,20 @@ class Database:
     # ---- folder_overrides --------------------------------------------------
 
     def set_folder_override(self, source_folder: str, *, event_name=None,
-                            date_override=None, note=None, updated_at: str) -> None:
+                            date_override=None, note=None, per_day_split=0,
+                            updated_at: str) -> None:
         """Upsert a per-folder override. event_name/date_override = None clears
-        that column for the folder. Stores the full row keyed by source_folder."""
+        that column; per_day_split (0/1) flags an event for per-day {mmdd}/ split.
+        Stores the full row keyed by source_folder."""
         self.conn.execute(
             "INSERT INTO folder_overrides "
-            "(source_folder, event_name, date_override, note, updated_at) "
-            "VALUES (?,?,?,?,?) "
+            "(source_folder, event_name, date_override, note, per_day_split, updated_at) "
+            "VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(source_folder) DO UPDATE SET "
             "event_name=excluded.event_name, date_override=excluded.date_override, "
-            "note=excluded.note, updated_at=excluded.updated_at",
-            (source_folder, event_name, date_override, note, updated_at),
+            "note=excluded.note, per_day_split=excluded.per_day_split, "
+            "updated_at=excluded.updated_at",
+            (source_folder, event_name, date_override, note, int(per_day_split), updated_at),
         )
 
     def clear_folder_override(self, source_folder: str) -> None:
