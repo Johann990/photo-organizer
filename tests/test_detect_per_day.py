@@ -119,7 +119,7 @@ def test_no_event_root_not_detected(tmp_path):
         _add(db, r"D:\Raw\0808\a.jpg", "2005:08:08 10:00:00")
         _add(db, r"D:\Raw\0809\b.jpg", "2005:08:09 10:00:00")
         cands = detect_per_day_events(db, SR)
-    assert cands == [] or all("D:\Raw" != c["event_folder"] for c in cands)
+    assert cands == [] or all(r"D:\Raw" != c["event_folder"] for c in cands)
 
 
 def test_needing_split_flags_scattered_multiday(tmp_path):
@@ -146,6 +146,19 @@ def test_needing_split_skips_contiguous_trip(tmp_path):
         _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
         _add(db, root + r"\b.jpg", "2012:09:02 10:00:00")
         _add(db, root + r"\c.jpg", "2012:09:03 10:00:00")
+        out = detect_multiday_needing_split(db, SR)
+    assert all(c["event_folder"] != root for c in out)
+
+
+def test_needing_split_skips_exact_gap_boundary(tmp_path):
+    # Gap exactly _EVENT_DAY_GAP (3) is inclusive on the skip side: 09-01 → 09-04
+    # has gaps=[3], all(<=3) → still a coherent trip → NOT flagged.
+    from photo_organizer.planner import detect_multiday_needing_split
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Long Weekend"
+        _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
+        _add(db, root + r"\b.jpg", "2012:09:04 10:00:00")  # gap == 3
         out = detect_multiday_needing_split(db, SR)
     assert all(c["event_folder"] != root for c in out)
 
