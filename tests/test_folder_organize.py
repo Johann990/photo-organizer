@@ -557,3 +557,29 @@ def test_get_page_has_thumb_imgs(tmp_path):
             assert 'src="/thumb/' in body
         finally:
             httpd.shutdown()
+
+
+def test_per_day_cards_marked_and_saveall_excludes_them(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        # a per-day candidate (multi-day, day-foldered)
+        root = r"D:\Raw\20050814 蒙古"
+        _add_file(db, root + r"\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\0809\b.jpg",
+                  datetime_original="2005:08:09 10:00:00", date_confidence="HIGH")
+        # a regular no-event candidate (immediate parent)
+        _add_file(db, r"D:\DCIM\100EOS5D\IMG.jpg",
+                  datetime_original="2012:09:08 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{httpd.server_address[1]}/").read().decode()
+            # per-day cards carry the data-pd marker; saveAll excludes them
+            assert 'data-pd="1"' in body
+            assert ".card:not([data-pd])" in body
+        finally:
+            httpd.shutdown()

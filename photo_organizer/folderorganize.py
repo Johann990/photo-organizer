@@ -178,7 +178,7 @@ function clearFolder(folder) {
   }).then(r => { if (r.ok) setSaved(folder, false); });
 }
 function saveAll() {
-  const cards = document.querySelectorAll('.card');
+  const cards = document.querySelectorAll('.card:not([data-pd])');
   const overrides = [];
   cards.forEach(el => overrides.push(readCard(el.dataset.folder)));
   const msg = document.getElementById('allmsg');
@@ -420,7 +420,7 @@ def _per_day_section_html(state: FolderOrganizeState) -> str:
             ovr = state._overrides.get(root)
             checked = "checked" if (ovr and ovr["per_day_split"]) else ""
             cards.append(
-                f'<div class="card" data-folder="{html.escape(root, quote=True)}">'
+                f'<div class="card" data-pd="1" data-folder="{html.escape(root, quote=True)}">'
                 f'<div class="path">&#128193; {html.escape(root)}</div>'
                 f'<div class="stats">{c["span"]} 天 &middot; {len(c["subfolders"])} 個每日子夾</div>'
                 f'<label class="pdlabel"><input type="checkbox" class="pdtoggle" {checked}> '
