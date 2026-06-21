@@ -661,6 +661,47 @@ def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) ->
     return out
 
 
+def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = None,
+                                  exclude: set[str] | None = None) -> list[dict]:
+    """Event roots whose confident photos span multiple days (2..MAX_EVENT_SPAN_DAYS)
+    but are NOT already organized into per-day subfolders — read-only suggestions to
+    split manually in Explorer. Excludes scan roots and any folder in `exclude`
+    (typically the detect_per_day_events results). DB-only.
+    Returns [{event_folder, days:int, span:int}] sorted by -span."""
+    exclude = exclude or set()
+    root_set = {str(Path(r)) for r in (scan_roots or [])}
+    days_by_root: dict[str, set] = defaultdict(set)
+    for batch in db.iter_files():
+        for row in batch:
+            if row["status"] == "error":
+                continue
+            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
+                continue
+            if row["date_confidence"] not in ("HIGH", "MEDIUM"):
+                continue
+            dt = _parse_exif_dt(row["datetime_original"])
+            if dt is None:
+                continue
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            if resolved is None:
+                continue
+            r = str(resolved)
+            if r in root_set or r in exclude:
+                continue
+            days_by_root[r].add(dt.date())
+    out: list[dict] = []
+    for r, days in days_by_root.items():
+        ds = sorted(days)
+        if len(ds) < 2:
+            continue
+        span = (ds[-1] - ds[0]).days + 1
+        if span > MAX_EVENT_SPAN_DAYS:
+            continue
+        out.append({"event_folder": r, "days": len(ds), "span": span})
+    out.sort(key=lambda c: -c["span"])
+    return out
+
+
 def _event_base_map(db: Database, known_cameras: set[str],
                     scan_roots: list[Path] | None = None) -> dict[str, str]:
     """resolved_event_folder(str) -> 'Masters' if ANY photo in that event has a

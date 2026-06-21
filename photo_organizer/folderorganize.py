@@ -46,6 +46,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _merge_override(existing, payload):
+    """Resolve (event_name, date_override, per_day_split) for an upsert, taking
+    each field from the payload when present, else preserving the existing row."""
+    def _str_field(name):
+        if name in payload:
+            v = payload.get(name)
+            return (v.strip() or None) if isinstance(v, str) else (v or None)
+        return existing[name] if existing else None
+    ev = _str_field("event_name")
+    dt = _str_field("date_override")
+    if "per_day_split" in payload:
+        pds = int(payload["per_day_split"] or 0)
+    else:
+        pds = existing["per_day_split"] if existing else 0
+    return ev, dt, pds
+
+
 # -----------------------------------------------------------------------
 # Inline CSS
 # -----------------------------------------------------------------------
@@ -181,6 +198,17 @@ function saveAll() {
 }
 function expandAll() { document.querySelectorAll('details.group').forEach(d => d.open = true); }
 function collapseAll() { document.querySelectorAll('details.group').forEach(d => d.open = false); }
+function savePerDay(btn){
+  const card = btn.closest('.card');
+  const folder = card.dataset.folder;
+  const pds = card.querySelector('.pdtoggle').checked ? 1 : 0;
+  fetch('/folder-override', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({source_folder: folder, per_day_split: pds})})
+    .then(r => r.json()).then(j => {
+      card.querySelector('.saved').textContent = j.ok ? '\\u2713 saved' : 'error';
+    });
+}
 """
 
 
@@ -274,6 +302,12 @@ class FolderOrganizeState:
         self.thumbs = ThumbCache(db.path.parent / "_staging" / ".thumbs")
         self.lock = threading.Lock()
         self.groups: list[dict] = self._build_groups()
+
+        from .planner import detect_multiday_needing_split, detect_per_day_events
+        self._overrides = overrides
+        self.per_day_candidates = detect_per_day_events(db)
+        _pd_roots = {c["event_folder"] for c in self.per_day_candidates}
+        self.split_reminders = detect_multiday_needing_split(db, exclude=_pd_roots)
 
     def _build_groups(self) -> list[dict]:
         """Group candidate folders by their parent ("mother") folder so runs
@@ -376,13 +410,58 @@ def _group_html(group: dict) -> str:
     )
 
 
+def _per_day_section_html(state: FolderOrganizeState) -> str:
+    """Per-day-split candidate cards + the read-only needs-split reminder list."""
+    pd_html = ""
+    if state.per_day_candidates:
+        cards = []
+        for c in state.per_day_candidates:
+            root = c["event_folder"]
+            ovr = state._overrides.get(root)
+            checked = "checked" if (ovr and ovr["per_day_split"]) else ""
+            cards.append(
+                f'<div class="card" data-folder="{html.escape(root, quote=True)}">'
+                f'<div class="path">&#128193; {html.escape(root)}</div>'
+                f'<div class="stats">{c["span"]} 天 &middot; {len(c["subfolders"])} 個每日子夾</div>'
+                f'<label class="pdlabel"><input type="checkbox" class="pdtoggle" {checked}> '
+                f'依日分夾 (per-day split)</label> '
+                f'<button onclick="savePerDay(this)">save</button>'
+                f'<span class="saved"></span>'
+                f'</div>'
+            )
+        pd_html = (
+            '<details class="group" open><summary class="ghead">'
+            f'&#128193; 多日活動已按日分夾 &mdash; 建議依日分夾 ({len(state.per_day_candidates)})'
+            '</summary>' + "".join(cards) + '</details>'
+        )
+    rem_html = ""
+    if state.split_reminders:
+        items = "".join(
+            f'<li>{html.escape(c["event_folder"])} '
+            f'<span class="stats">({c["span"]} 天 / {c["days"]} 個日期)</span></li>'
+            for c in state.split_reminders[:50]
+        )
+        more = (f'<li class="stats">&hellip; +{len(state.split_reminders) - 50} more</li>'
+                if len(state.split_reminders) > 50 else "")
+        rem_html = (
+            '<details class="group"><summary class="ghead">'
+            f'&#9888; 多日但無每日子夾 &mdash; 建議去檔案總管手動拆 ({len(state.split_reminders)})'
+            f'</summary><ul class="samples">{items}{more}</ul>'
+            '<p class="sub">拆成每日子夾後跑 <b>relocate</b> 再 <b>plan</b>。</p>'
+            '</details>'
+        )
+    return pd_html + rem_html
+
+
 def _render_page(state: FolderOrganizeState) -> bytes:
     total = state.total()
-    if total == 0:
+    if total == 0 and not state.per_day_candidates and not state.split_reminders:
         body = '<p class="sub">No folders need attention. Run plan to see the result.</p>'
         actionbar = ""
     else:
-        body = "".join(_group_html(group) for group in state.groups)
+        body = _per_day_section_html(state) + "".join(
+            _group_html(group) for group in state.groups
+        )
         actionbar = (
             f'<div class="actionbar">'
             f'<button class="primary" onclick="saveAll()">Save all {total} folder(s)</button>'
@@ -473,11 +552,11 @@ def _make_handler(state: FolderOrganizeState):
                     with state.lock:
                         for d in payload.get("overrides", []):
                             source_folder = str(d["source_folder"])
-                            ev = (d.get("event_name") or "").strip() or None
-                            dt = (d.get("date_override") or "").strip() or None
+                            existing = state.db.get_folder_overrides().get(source_folder)
+                            ev, dt, pds = _merge_override(existing, d)
                             state.db.set_folder_override(
                                 source_folder, event_name=ev, date_override=dt,
-                                note=None, updated_at=now,
+                                per_day_split=pds, note=None, updated_at=now,
                             )
                             saved += 1
                         state.db.commit()
@@ -490,13 +569,12 @@ def _make_handler(state: FolderOrganizeState):
 
                 # /folder-override
                 source_folder = str(payload["source_folder"])
-                ev = (payload.get("event_name") or "").strip() or None
-                dt = (payload.get("date_override") or "").strip() or None
-                now = _now()
                 with state.lock:
+                    existing = state.db.get_folder_overrides().get(source_folder)
+                    ev, dt, pds = _merge_override(existing, payload)
                     state.db.set_folder_override(
                         source_folder, event_name=ev, date_override=dt,
-                        note=None, updated_at=now,
+                        per_day_split=pds, note=None, updated_at=_now(),
                     )
                     state.db.commit()
                 self._send(200, b'{"ok":true}', "application/json")

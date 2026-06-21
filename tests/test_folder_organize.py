@@ -371,6 +371,73 @@ def test_post_override_all(tmp_path):
             httpd.shutdown()
 
 
+def test_per_day_candidate_listed(tmp_path):
+    from photo_organizer.folderorganize import FolderOrganizeState
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\20050814 蒙古"
+        _add_file(db, root + r"\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\0809\b.jpg",
+                  datetime_original="2005:08:09 10:00:00", date_confidence="HIGH")
+        st = FolderOrganizeState(db)
+        roots = {c["event_folder"] for c in st.per_day_candidates}
+        assert root in roots
+
+
+def test_post_per_day_split_saves(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\20050814 蒙古"
+        _add_file(db, root + r"\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({"source_folder": root, "per_day_split": 1}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            assert db.get_folder_overrides()[root]["per_day_split"] == 1
+        finally:
+            httpd.shutdown()
+
+
+def test_per_day_toggle_does_not_clobber_event_name(tmp_path):
+    # Setting per_day_split via POST must preserve an existing event_name.
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\20050814 蒙古"
+        _add_file(db, root + r"\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        db.set_folder_override(root, event_name="蒙古", updated_at="2026-06-21T00:00:00+00:00")
+        db.commit()
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({"source_folder": root, "per_day_split": 1}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            ov = db.get_folder_overrides()[root]
+            assert ov["per_day_split"] == 1
+            assert ov["event_name"] == "蒙古"   # NOT clobbered
+        finally:
+            httpd.shutdown()
+
+
 def test_cli_review_organize_wired():
     import photo_organizer.__main__ as m
     parser = m.build_parser()

@@ -120,3 +120,40 @@ def test_no_event_root_not_detected(tmp_path):
         _add(db, r"D:\Raw\0809\b.jpg", "2005:08:09 10:00:00")
         cands = detect_per_day_events(db, SR)
     assert cands == [] or all("D:\Raw" != c["event_folder"] for c in cands)
+
+
+def test_needing_split_flags_multiday_without_subfolders(tmp_path):
+    from photo_organizer.planner import detect_multiday_needing_split
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Taiwan Trip"
+        # photos sit DIRECTLY in the event folder, spanning 3 days (not day-foldered)
+        _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
+        _add(db, root + r"\b.jpg", "2012:09:02 10:00:00")
+        _add(db, root + r"\c.jpg", "2012:09:03 10:00:00")
+        out = detect_multiday_needing_split(db, SR)
+    assert any(c["event_folder"] == root for c in out)
+
+
+def test_needing_split_excludes_already_day_organized(tmp_path):
+    from photo_organizer.planner import detect_multiday_needing_split, detect_per_day_events
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\20050814 蒙古"
+        _add(db, root + r"\0808\a.jpg", "2005:08:08 10:00:00")
+        _add(db, root + r"\0809\b.jpg", "2005:08:09 10:00:00")
+        cands = {c["event_folder"] for c in detect_per_day_events(db, SR)}
+        out = detect_multiday_needing_split(db, SR, exclude=cands)
+    # already day-organized → should NOT appear in the needs-split reminder
+    assert all(c["event_folder"] != root for c in out)
+
+
+def test_needing_split_ignores_single_day(tmp_path):
+    from photo_organizer.planner import detect_multiday_needing_split
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\OneDay"
+        _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
+        _add(db, root + r"\b.jpg", "2012:09:01 12:00:00")
+        out = detect_multiday_needing_split(db, SR)
+    assert all(c["event_folder"] != root for c in out)
