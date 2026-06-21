@@ -371,6 +371,42 @@ def test_post_override_all(tmp_path):
             httpd.shutdown()
 
 
+def test_override_all_preserves_per_day_split(tmp_path):
+    # /folder-override-all sets event names but its payload omits per_day_split.
+    # An existing per_day_split flag must survive the bulk save (merge, not clobber).
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\Raw\20050814 蒙古"
+        _add_file(db, folder + r"\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        db.set_folder_override(
+            folder, per_day_split=1, updated_at="2026-06-21T00:00:00+00:00"
+        )
+        db.commit()
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({
+                "overrides": [{"source_folder": folder, "event_name": "蒙古"}]
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override-all",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            ov = db.get_folder_overrides()[folder]
+            assert ov["event_name"] == "蒙古"
+            assert ov["per_day_split"] == 1   # preserved, not clobbered to 0
+        finally:
+            httpd.shutdown()
+
+
 def test_per_day_candidate_listed(tmp_path):
     from photo_organizer.folderorganize import FolderOrganizeState
     db_path = tmp_path / ".photo_organizer" / "library.db"

@@ -445,9 +445,9 @@ def _per_day_section_html(state: FolderOrganizeState) -> str:
                 if len(state.split_reminders) > 50 else "")
         rem_html = (
             '<details class="group"><summary class="ghead">'
-            f'&#9888; 多日但無每日子夾 &mdash; 建議去檔案總管手動拆 ({len(state.split_reminders)})'
+            f'&#9888; 多日且日期分散的資料夾&#65288;可能混了不同活動&#65289; &mdash; {len(state.split_reminders)}'
             f'</summary><ul class="samples">{items}{more}</ul>'
-            '<p class="sub">拆成每日子夾後跑 <b>relocate</b> 再 <b>plan</b>。</p>'
+            '<p class="sub">若想把不同活動分開&#65306;在檔案總管拆夾 &rarr; <b>relocate</b> &rarr; <b>plan</b>。</p>'
             '</details>'
         )
     return pd_html + rem_html

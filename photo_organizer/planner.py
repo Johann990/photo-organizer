@@ -663,11 +663,13 @@ def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) ->
 
 def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = None,
                                   exclude: set[str] | None = None) -> list[dict]:
-    """Event roots whose confident photos span multiple days (2..MAX_EVENT_SPAN_DAYS)
-    but are NOT already organized into per-day subfolders — read-only suggestions to
-    split manually in Explorer. Excludes scan roots and any folder in `exclude`
-    (typically the detect_per_day_events results). DB-only.
-    Returns [{event_folder, days:int, span:int}] sorted by -span."""
+    """Event roots whose confident photos span multiple days with a SCATTERED /
+    non-contiguous date profile (at least one adjacent-day gap > _EVENT_DAY_GAP)
+    and are NOT already day-organized — i.e. likely several different occasions
+    dumped together, worth a manual look. A coherent contiguous trip (all gaps
+    <= _EVENT_DAY_GAP) is filed fine flat and is NOT flagged. Excludes scan roots
+    and any folder in `exclude` (typically the detect_per_day_events results).
+    DB-only. Returns [{event_folder, days:int, span:int}] sorted by -span."""
     exclude = exclude or set()
     root_set = {str(Path(r)) for r in (scan_roots or [])}
     days_by_root: dict[str, set] = defaultdict(set)
@@ -697,6 +699,9 @@ def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = 
         span = (ds[-1] - ds[0]).days + 1
         if span > MAX_EVENT_SPAN_DAYS:
             continue
+        gaps = [(ds[i + 1] - ds[i]).days for i in range(len(ds) - 1)]
+        if all(g <= _EVENT_DAY_GAP for g in gaps):
+            continue  # contiguous trip → coherent event, filed fine flat, skip
         out.append({"event_folder": r, "days": len(ds), "span": span})
     out.sort(key=lambda c: -c["span"])
     return out

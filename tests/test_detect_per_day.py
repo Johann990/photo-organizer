@@ -122,17 +122,32 @@ def test_no_event_root_not_detected(tmp_path):
     assert cands == [] or all("D:\Raw" != c["event_folder"] for c in cands)
 
 
-def test_needing_split_flags_multiday_without_subfolders(tmp_path):
+def test_needing_split_flags_scattered_multiday(tmp_path):
+    from photo_organizer.planner import detect_multiday_needing_split
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        # photos sit DIRECTLY in the event folder; the dates are SCATTERED — a
+        # >3-day gap between clusters → likely several occasions dumped together.
+        _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
+        _add(db, root + r"\b.jpg", "2012:09:02 10:00:00")
+        _add(db, root + r"\c.jpg", "2012:09:20 10:00:00")  # 18-day gap
+        out = detect_multiday_needing_split(db, SR)
+    assert any(c["event_folder"] == root for c in out)
+
+
+def test_needing_split_skips_contiguous_trip(tmp_path):
     from photo_organizer.planner import detect_multiday_needing_split
     db_path = tmp_path / ".photo_organizer" / "library.db"
     with Database(db_path) as db:
         root = r"D:\Raw\Taiwan Trip"
-        # photos sit DIRECTLY in the event folder, spanning 3 days (not day-foldered)
+        # consecutive days (all gaps <= _EVENT_DAY_GAP) → coherent trip, filed
+        # fine flat → NOT flagged.
         _add(db, root + r"\a.jpg", "2012:09:01 10:00:00")
         _add(db, root + r"\b.jpg", "2012:09:02 10:00:00")
         _add(db, root + r"\c.jpg", "2012:09:03 10:00:00")
         out = detect_multiday_needing_split(db, SR)
-    assert any(c["event_folder"] == root for c in out)
+    assert all(c["event_folder"] != root for c in out)
 
 
 def test_needing_split_excludes_already_day_organized(tmp_path):
