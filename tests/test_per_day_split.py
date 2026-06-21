@@ -104,3 +104,21 @@ def test_flagged_multiday_video_splits_by_day(tmp_path):
                            overrides=overrides, event_base={root: "Masters"})
     # video co-locates under the per-day folder's Videos/ subfolder
     assert str(Path("2005-08-08(2d) 蒙古") / "0808" / "Videos") in str(p)
+
+
+def test_nodate_member_of_flagged_event_skips_mmdd(tmp_path):
+    # A date-less file in a flagged multi-day event must NOT get an {mmdd}/ level;
+    # it falls back to the global NoDate tree (dt is None → handled before split).
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\20050814 蒙古"
+        r = _add(db, root + r"\0808\IMG_nodate.jpg", dto=None, conf=None)
+        db.set_folder_override(root, per_day_split=1, updated_at="2026-06-21T00:00:00+00:00")
+        db.commit()
+        overrides = db.get_folder_overrides()
+        groups = {root: {"kind": "event", "start": date(2005, 8, 8), "span": 2}}
+    p = _build_target_path(r, Path("D:/Media"), {"canon eos 5d"}, {},
+                           event_groups=groups, scan_roots=SR,
+                           overrides=overrides, event_base={root: "Masters"})
+    assert "NoDate" in str(p)
+    assert "蒙古" not in str(p)   # no event/per-day folder for a date-less file
