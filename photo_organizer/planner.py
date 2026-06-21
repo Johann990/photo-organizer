@@ -991,9 +991,9 @@ def _build_target_path(
 
     Photos (ORIGINAL filename kept):
       Single-day event:
-        Masters/{YYYY}/{YYYY-MM-DD}_{event}/{original_name}
+        Masters/{YYYY}/{YYYY-MM-DD} {event}/{original_name}
       Multi-day event (2…MAX_EVENT_SPAN_DAYS days, from event_groups):
-        Masters/{YYYY}/{start-date}_{N}d_{event}/{original_name}
+        Masters/{YYYY}/{YYYY-MM-DD}({N}d) {event}/{original_name}
         — ALL of the event's files land in this one folder (year = start year).
       Subject collection (named folder spanning > MAX_EVENT_SPAN_DAYS days):
         Masters/{event}/{YYYY}/{original_name}
@@ -1001,15 +1001,15 @@ def _build_target_path(
       Others/  — camera not in known_cameras list
       NoDate/  — no EXIF datetime
       The {event} segment is dropped when the folder does not resolve to a real
-      name, leaving just {YYYY-MM-DD}/ (or {start-date}_{N}d/).  RAW+JPEG pairs
+      name, leaving just {YYYY-MM-DD}/ (or {YYYY-MM-DD}({N}d)/).  RAW+JPEG pairs
       keep the same stem naturally because original camera filenames are kept.
     Videos (V3 — CO-LOCATED with the event's photos, in a Videos/ subfolder of
     the SAME event folder; base (Masters/Others) follows the event's photos
     via `event_base`, not the video's own camera):
       Single-day event:
-        {base}/{YYYY}/{YYYY-MM-DD}_{event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT
+        {base}/{YYYY}/{YYYY-MM-DD} {event}/Videos/{YYYY-MM-DD}_{seq:04d}.EXT
       Multi-day event:
-        {base}/{startYYYY}/{start}_{N}d_{event}/Videos/{date}_{seq:04d}.EXT
+        {base}/{startYYYY}/{YYYY-MM-DD}({N}d) {event}/Videos/{date}_{seq:04d}.EXT
       Subject collection:
         {base}/{event}/{YYYY}/Videos/{date}_{seq:04d}.EXT
       No resolved event (camera-dump folder), but dated — base follows the
