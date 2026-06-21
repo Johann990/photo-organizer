@@ -70,8 +70,8 @@ def test_event_override_photo(tmp_path):
         row, target, known_cameras=set(), counters={}, event_groups={},
         overrides=overrides,
     )
-    assert "_上海" in str(result)
-    assert str(Path("2012") / "2012-09-08_上海") in str(result)
+    assert " 上海" in str(result)
+    assert str(Path("2012") / "2012-09-08 上海") in str(result)
 
 
 def test_event_override_video(tmp_path):
@@ -96,7 +96,7 @@ def test_event_override_video(tmp_path):
     )
     # V3: video co-locates inside the event folder's own Videos/ subfolder
     # (base defaults to "Others" — no event_base map / known camera here).
-    assert str(Path("2012-09-08_上海") / "Videos") in str(result)
+    assert str(Path("2012-09-08 上海") / "Videos") in str(result)
     assert "2012-09-08_0000" in str(result)
 
 

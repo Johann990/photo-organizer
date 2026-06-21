@@ -963,11 +963,11 @@ def _event_subdir(base: Path, dt: datetime, event: str, group: dict | None,
         return base / folder / dt.strftime("%Y")
     if group and group["kind"] == "event":
         start = group["start"]
-        stamp = f"{start.isoformat()}_{group['span']}d"
-        folder = f"{stamp}_{event}" if event else stamp
+        stamp = f"{start.strftime('%Y-%m-%d')}({group['span']}d)"
+        folder = f"{stamp} {event}" if event else stamp
         return base / start.strftime("%Y") / folder
     day = dt.strftime("%Y-%m-%d")
-    folder = f"{day}_{event}" if event else day
+    folder = f"{day} {event}" if event else day
     return base / dt.strftime("%Y") / folder
 
 

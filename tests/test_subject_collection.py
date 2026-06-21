@@ -149,7 +149,7 @@ def test_video_event_kind_unaffected_existing_path(tmp_path):
         # V3: no event_groups passed → falls to the single-day folder shape,
         # but still co-locates under the resolved event folder's Videos/.
         t1 = _build_target_path(_row(db, v1), target, set(), {})
-        assert t1.parent == target / "Others" / "2015" / "2015-06-01_Wedding" / "Videos"
+        assert t1.parent == target / "Others" / "2015" / "2015-06-01 Wedding" / "Videos"
         assert t1.name.startswith("2015-06-01_")
 
         # Unresolved/no-group video (no datetime at all) → Videos/NoDate/.

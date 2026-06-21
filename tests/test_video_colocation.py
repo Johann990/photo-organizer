@@ -96,7 +96,7 @@ def test_video_single_day_event_colocated(tmp_path):
         event_base={resolved_key: "Masters"},
     )
     expected = (
-        target / "Masters" / "2012" / "2012-09-08_Kyoto" / "Videos"
+        target / "Masters" / "2012" / "2012-09-08 Kyoto" / "Videos"
         / "2012-09-08_0000.MP4"
     )
     assert result == expected
@@ -126,7 +126,7 @@ def test_video_multiday_event_colocated(tmp_path):
         event_base={resolved_key: "Masters"},
     )
     expected = (
-        target / "Masters" / "2012" / "2012-09-08_3d_Kyoto" / "Videos"
+        target / "Masters" / "2012" / "2012-09-08(3d) Kyoto" / "Videos"
         / "2012-09-09_0000.MP4"
     )
     assert result == expected
@@ -345,7 +345,7 @@ def test_video_event_override_colocated(tmp_path):
         row, target, known_cameras=set(), counters={}, event_groups={},
         overrides=overrides, event_base={},
     )
-    assert str(Path("2012-09-08_上海") / "Videos") in str(result)
+    assert str(Path("2012-09-08 上海") / "Videos") in str(result)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ def test_photo_paths_unchanged_after_refactor(tmp_path):
         event_groups={},
     )
     assert single_result == (
-        target / "Masters" / "2012" / "2012-09-08_Kyoto" / "IMG_0001.jpg"
+        target / "Masters" / "2012" / "2012-09-08 Kyoto" / "IMG_0001.jpg"
     )
 
     subject_group = {str(Path(subject_folder)): {"kind": "subject", "label": "愷"}}
@@ -427,5 +427,5 @@ def test_plan_video_colocation_end_to_end(tmp_path):
         target_path = op["target_path"]
 
     assert "Masters" in target_path
-    assert "2012-09-08_Kyoto" in target_path
+    assert "2012-09-08 Kyoto" in target_path
     assert "Videos" in target_path
