@@ -35,6 +35,7 @@ columns already populated by the scan/dedup machinery — no disk re-read):
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -81,22 +82,33 @@ class _Event:
     date_hi: date | None = None
 
 
+_EVENT_NAME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})"        # leading ISO date
+    r"(?:\((\d+)d\)|_(\d+)d)?"     # optional span: '(Nd)' (current) or '_Nd' (legacy)
+)
+
+
 def _event_folder_date_range(name: str) -> tuple[date, date] | None:
     """
-    Parse the date range encoded in a materialized event-folder name:
-      '2023-06-15_Kyoto'      → single day  → (2023-06-15, 2023-06-15)
-      '2023-06-15_3d_Kyoto'   → multi-day   → (2023-06-15, 2023-06-17)
+    Parse the date range encoded in a materialized event-folder name. Handles the
+    current naming (ISO date + optional '(Nd)' span + space) AND the legacy
+    underscore form, so `add` matches events regardless of when they were filed:
+      '2023-06-15 Kyoto'      → single day  → (2023-06-15, 2023-06-15)
+      '2023-06-15(3d) Kyoto'  → multi-day   → (2023-06-15, 2023-06-17)
+      '2023-06-15_3d_Kyoto'   → legacy      → (2023-06-15, 2023-06-17)
       '2023-06-15'            → single day
     Returns None when the name carries no leading date (e.g. NoDate folders).
     """
-    parts = name.split("_")
-    try:
-        start = datetime.strptime(parts[0], "%Y-%m-%d").date()
-    except (ValueError, IndexError):
+    m = _EVENT_NAME_RE.match(name)
+    if not m:
         return None
-    # Multi-day marker is the next segment shaped like '3d'.
-    if len(parts) >= 2 and len(parts[1]) >= 2 and parts[1][-1] == "d" and parts[1][:-1].isdigit():
-        span = int(parts[1][:-1])
+    try:
+        start = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    span_str = m.group(2) or m.group(3)   # '(Nd)' or '_Nd'
+    if span_str:
+        span = int(span_str)
         if span >= 1:
             return start, start + timedelta(days=span - 1)
     return start, start

@@ -261,8 +261,6 @@ def _sibling_date_hints(db: Database) -> dict[str, datetime]:
     folder's confidently-dated NON-VIDEO photos (HIGH/MEDIUM). Used to date
     videos in that folder that have no capture time of their own. Representative
     date = the most common photo date in the folder (ties → earliest)."""
-    from collections import Counter, defaultdict
-
     by_folder: dict[str, Counter] = defaultdict(Counter)
     for r in db.conn.execute(
         "SELECT path, datetime_original, date_confidence, file_type FROM files "

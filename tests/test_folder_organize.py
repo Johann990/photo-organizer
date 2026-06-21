@@ -421,6 +421,29 @@ def test_per_day_candidate_listed(tmp_path):
         assert root in roots
 
 
+def test_state_forwards_scan_roots_to_detect(tmp_path):
+    # Wiring guard: day-serial subfolders sitting DIRECTLY under a scan root
+    # resolve UP to the scan root, which the detect guard excludes — but only
+    # when scan_roots is actually forwarded. Without it, _resolve_event_folder
+    # is unbounded and the scan root masquerades as a per-day event.
+    from pathlib import Path
+
+    from photo_organizer.folderorganize import FolderOrganizeState
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        _add_file(db, r"D:\Raw\0808\a.jpg",
+                  datetime_original="2005:08:08 10:00:00", date_confidence="HIGH")
+        _add_file(db, r"D:\Raw\0809\b.jpg",
+                  datetime_original="2005:08:09 10:00:00", date_confidence="HIGH")
+        without = {c["event_folder"]
+                   for c in FolderOrganizeState(db).per_day_candidates}
+        with_roots = {c["event_folder"] for c in
+                      FolderOrganizeState(db, [Path(r"D:\Raw")]).per_day_candidates}
+    # forwarding scan_roots excludes the scan root itself from the suggestions
+    assert r"D:\Raw" in without          # unbounded resolution mis-flags it
+    assert r"D:\Raw" not in with_roots   # guard fires once roots are forwarded
+
+
 def test_post_per_day_split_saves(tmp_path):
     import urllib.request
     from photo_organizer.folderorganize import serve

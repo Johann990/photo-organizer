@@ -15,13 +15,16 @@ folder, then plans additions for NEW files and asserts the critical invariant:
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
+
+import pytest
 
 from photo_organizer.adder import plan_additions
 from photo_organizer.db import Database
 
 KNOWN_CAMERA = "TestCam"
-EVENT_DIRNAME = "2023-06-15_3d_Kyoto"  # multi-day → range 2023-06-15 … 2023-06-17
+EVENT_DIRNAME = "2023-06-15(3d) Kyoto"  # multi-day → range 2023-06-15 … 2023-06-17
 
 
 def _add_file(
@@ -225,3 +228,22 @@ def test_add_no_new_files_is_noop(tmp_path):
             "SELECT COUNT(*) FROM operations WHERE status='planned'"
         ).fetchone()[0]
         assert planned == 0
+
+
+@pytest.mark.parametrize("name, expected", [
+    # current naming: ISO date + optional '(Nd)' span + space-separated event
+    ("2023-06-15 Kyoto", (date(2023, 6, 15), date(2023, 6, 15))),
+    ("2023-06-15(3d) Kyoto", (date(2023, 6, 15), date(2023, 6, 17))),
+    ("2023-06-15(3d)", (date(2023, 6, 15), date(2023, 6, 17))),
+    ("2023-06-15", (date(2023, 6, 15), date(2023, 6, 15))),
+    # legacy underscore naming must still parse (folders filed by older builds)
+    ("2023-06-15_Kyoto", (date(2023, 6, 15), date(2023, 6, 15))),
+    ("2023-06-15_3d_Kyoto", (date(2023, 6, 15), date(2023, 6, 17))),
+    # no leading date → None (e.g. NoDate / subject folders)
+    ("NoDate", None),
+    ("Kyoto", None),
+    ("", None),
+])
+def test_event_folder_date_range_parses_both_formats(name, expected):
+    from photo_organizer.adder import _event_folder_date_range
+    assert _event_folder_date_range(name) == expected

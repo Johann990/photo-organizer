@@ -219,7 +219,7 @@ function savePerDay(btn){
 class FolderOrganizeState:
     """Loaded once at server start: candidate folders needing attention."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, scan_roots: list | None = None) -> None:
         staged = {
             row[0] for row in
             db.conn.execute("SELECT file_id FROM operations WHERE op_type='STAGE_DELETE'")
@@ -303,11 +303,17 @@ class FolderOrganizeState:
         self.lock = threading.Lock()
         self.groups: list[dict] = self._build_groups()
 
+        # scan_roots is load-bearing: without it _resolve_event_folder is
+        # unbounded and climbs ABOVE the real scan root, so the "never treat a
+        # scan root as an event" guard in both detect_* helpers never fires and
+        # the suggestions diverge from what `plan` (which always passes roots)
+        # actually does. Forward the configured input_dirs.
         from .planner import detect_multiday_needing_split, detect_per_day_events
         self._overrides = overrides
-        self.per_day_candidates = detect_per_day_events(db)
+        self.per_day_candidates = detect_per_day_events(db, scan_roots)
         _pd_roots = {c["event_folder"] for c in self.per_day_candidates}
-        self.split_reminders = detect_multiday_needing_split(db, exclude=_pd_roots)
+        self.split_reminders = detect_multiday_needing_split(
+            db, scan_roots, exclude=_pd_roots)
 
     def _build_groups(self) -> list[dict]:
         """Group candidate folders by their parent ("mother") folder so runs
@@ -599,14 +605,18 @@ def serve(
     host: str = "127.0.0.1",
     open_browser: bool = True,
     background: bool = False,
+    scan_roots: list | None = None,
 ) -> ThreadingHTTPServer:
     """Start the local folder-organize review server.
 
     Binds 127.0.0.1 only (single local user, no auth). With background=False
     (the CLI default) this blocks until Ctrl-C. With background=True (tests)
     it returns the running server immediately; call .shutdown() to stop it.
+
+    scan_roots (the configured input_dirs) bounds event-folder resolution so the
+    per-day suggestions match what `plan` produces; see FolderOrganizeState.
     """
-    state = FolderOrganizeState(db)
+    state = FolderOrganizeState(db, scan_roots)
     httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     actual_port = httpd.server_address[1]
     url = f"http://{host}:{actual_port}/"
