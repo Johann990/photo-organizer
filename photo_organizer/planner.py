@@ -971,6 +971,18 @@ def _event_subdir(base: Path, dt: datetime, event: str, group: dict | None,
     return base / dt.strftime("%Y") / folder
 
 
+def _maybe_per_day(subdir: Path, dt: datetime, group: dict | None,
+                   resolved: Path | None, overrides: dict | None) -> Path:
+    """Append a {mmdd}/ subfolder (file's own day) when the file's event root is
+    flagged per_day_split AND the event is multi-day. No-op otherwise."""
+    if not (group and group.get("kind") == "event" and resolved is not None):
+        return subdir
+    ov = (overrides or {}).get(str(resolved))
+    if ov is not None and ov["per_day_split"]:
+        return subdir / dt.strftime("%m%d")
+    return subdir
+
+
 def _build_target_path(
     row: Any,
     target_root: Path,
@@ -1048,7 +1060,9 @@ def _build_target_path(
                 model = (row["camera_model"] or "").lower()
                 base_name = "Masters" if (model and model in known_cameras) else "Others"
             base = target_root / base_name
-            subdir = _event_subdir(base, dt, event, group, _ov_event) / "Videos"
+            ev_subdir = _event_subdir(base, dt, event, group, _ov_event)
+            ev_subdir = _maybe_per_day(ev_subdir, dt, group, resolved, overrides)
+            subdir = ev_subdir / "Videos"
             stem = dt.strftime("%Y-%m-%d")
 
         key = (str(subdir), stem)
@@ -1071,6 +1085,7 @@ def _build_target_path(
         in_known = bool(model_lower and model_lower in known_cameras)
         base = target_root / ("Masters" if in_known else "Others")
         subdir = _event_subdir(base, dt, event, group, _ov_event)
+        subdir = _maybe_per_day(subdir, dt, group, resolved, overrides)
 
     return subdir / row["filename"]
 
