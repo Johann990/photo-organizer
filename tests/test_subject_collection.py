@@ -122,8 +122,11 @@ def test_mtime_only_single_day_omitted_from_groups(tmp_path):
     folder = tmp_path / "src" / "SingleDay"
 
     with Database(db_path) as db:
-        _add_file(db, folder / "a.jpg", mtime="2015-06-01T08:00:00+00:00")
-        _add_file(db, folder / "b.jpg", mtime="2015-06-01T20:00:00+00:00")
+        # Both timestamps land on the same LOCAL calendar day once _parse_mtime
+        # converts from UTC — keep them an hour apart around UTC midday so no
+        # plausible local timezone offset pushes either across a day boundary.
+        _add_file(db, folder / "a.jpg", mtime="2015-06-01T10:00:00+00:00")
+        _add_file(db, folder / "b.jpg", mtime="2015-06-01T11:00:00+00:00")
         db.commit()
 
         groups = _compute_event_groups(db, set())

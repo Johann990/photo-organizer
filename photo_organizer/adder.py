@@ -337,6 +337,7 @@ def plan_additions(
         existing_sha[r["sha256"]].append(r["file_id"])
 
     stage_ids: set[int] = set()
+    dupe_of: dict[int, int] = {}  # staged file_id -> the keeper it duplicates
     # Group the new rows by hash so new-vs-new exact copies keep just one.
     new_by_sha: dict[str, list[Any]] = defaultdict(list)
     for row in new_rows:
@@ -350,6 +351,7 @@ def plan_additions(
             keeper = existing_sha[sha][0]
             for row in rows:
                 stage_ids.add(row["file_id"])
+                dupe_of[row["file_id"]] = keeper
                 db.insert_duplicate(row["file_id"], keeper, "EXACT", 0)
                 summary["exact_dup"] += 1
         elif len(rows) > 1:
@@ -359,6 +361,7 @@ def plan_additions(
             for row in rows:
                 if row["file_id"] != best["file_id"]:
                     stage_ids.add(row["file_id"])
+                    dupe_of[row["file_id"]] = best["file_id"]
                     db.insert_duplicate(row["file_id"], best["file_id"], "EXACT", 0)
                     summary["exact_dup"] += 1
     db.commit()
@@ -415,8 +418,9 @@ def plan_additions(
             ops.append({
                 "file_id": fid, "op_type": "STAGE_DELETE",
                 "source_path": row["path"],
-                "target_path": str(staging_root / f"{fid}_{row['filename']}"),
+                "target_path": str(staging_root / "exact_dupe" / f"{fid}_{row['filename']}"),
                 "status": "planned", "planned_at": now,
+                "stage_reason": "exact_dupe", "dupe_of_file_id": dupe_of.get(fid),
             })
             continue
 
@@ -447,14 +451,17 @@ def plan_additions(
             "file_id": fid, "op_type": "MOVE",
             "source_path": row["path"], "target_path": str(target),
             "status": "planned", "planned_at": now,
+            "stage_reason": None, "dupe_of_file_id": None,
         })
         summary["moved"] += 1
 
     if ops:
         db.conn.executemany(
             "INSERT OR IGNORE INTO operations "
-            "(file_id, op_type, source_path, target_path, status, planned_at) "
-            "VALUES (:file_id, :op_type, :source_path, :target_path, :status, :planned_at)",
+            "(file_id, op_type, source_path, target_path, status, planned_at, "
+            "stage_reason, dupe_of_file_id) "
+            "VALUES (:file_id, :op_type, :source_path, :target_path, :status, :planned_at, "
+            ":stage_reason, :dupe_of_file_id)",
             ops,
         )
         db.commit()

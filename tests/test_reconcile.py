@@ -12,6 +12,7 @@ from __future__ import annotations
 from photo_organizer.db import Database
 from photo_organizer.reconcile import (
     CONFLICT,
+    DELETED,
     ERROR,
     MOVED,
     SKIPPED,
@@ -158,4 +159,48 @@ def test_verify_disk_passes_when_all_present(tmp_path):
     db_path, _ = _build_clean_db(tmp_path)
     with Database(db_path) as db:
         # All moved/staged files were written to disk in the builder.
+        assert reconcile(db, verify_disk=True) is True
+
+
+# ── DELETED — a sync.acknowledge_deleted() acknowledgment (Pillar 2) ─────────
+# A 'done' file the user removed directly in Explorer, then ran
+# `sync delete` to record it. There is nothing to verify on disk (the path
+# is known gone), and it must NOT show up as UNACCOUNTED — that would be a
+# regression that re-introduces the exact "the DB looks broken when it
+# isn't" noise Pillar 1 set out to eliminate.
+
+def test_classify_done_delete_op_is_deleted_not_unaccounted():
+    row = {"path": "/x/gone.jpg", "file_type": "CAMERA_JPEG", "status": "done"}
+    assert _classify(row, [
+        {"op_type": "MOVE", "status": "done"},
+        {"op_type": "DELETE", "status": "done"},
+    ]) == DELETED
+
+
+def test_acknowledged_deleted_file_balances(tmp_path):
+    db_path, _ = _build_clean_db(tmp_path)
+    with Database(db_path) as db:
+        gone = _add_file(db, tmp_path / "gone.jpg", status="done")
+        _add_op(db, gone, "MOVE", "done")
+        _add_op(db, gone, "DELETE", "done", target=None)
+        db.commit()
+
+        ok = reconcile(db, verify_disk=False)
+        assert ok is True
+        anomalies = db.conn.execute(
+            "SELECT COUNT(*) FROM run_log WHERE phase='reconcile'"
+        ).fetchone()[0]
+        assert anomalies == 0
+
+
+def test_verify_disk_does_not_check_deleted_rows(tmp_path):
+    # gone.jpg's path never existed on disk at all — --verify-disk must not
+    # try to stat it (that's the whole point of acknowledging the deletion).
+    db_path, _ = _build_clean_db(tmp_path)
+    with Database(db_path) as db:
+        gone = _add_file(db, tmp_path / "never_existed.jpg", status="done")
+        _add_op(db, gone, "MOVE", "done")
+        _add_op(db, gone, "DELETE", "done", target=None)
+        db.commit()
+
         assert reconcile(db, verify_disk=True) is True

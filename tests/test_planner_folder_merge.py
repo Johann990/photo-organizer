@@ -38,12 +38,13 @@ def _add_overlap(db, folder_a, folder_b, keeper):
 def test_loser_staged_when_sha_in_keeper(tmp_path):
     db_path = tmp_path / ".photo_organizer" / "library.db"
     with Database(db_path) as db:
-        _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
+        keeper_id = _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
         loser_id = _add_file(db, r"D:\B\img001.jpg", sha=SHA_A)
         _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser_id in ids
     assert unique == 0
+    assert keeper_of[loser_id] == keeper_id
 
 
 def test_unique_to_loser_not_staged(tmp_path):
@@ -52,7 +53,7 @@ def test_unique_to_loser_not_staged(tmp_path):
         _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
         loser_id = _add_file(db, r"D:\B\img002.jpg", sha=SHA_C)
         _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser_id not in ids
     assert unique == 1
 
@@ -73,7 +74,7 @@ def test_both_keeper_skipped(tmp_path):
             (r"D:\A", r"D:\B"),
         )
         db.commit()
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert ids == set()
     assert unique == 0
 
@@ -84,7 +85,7 @@ def test_null_sha_not_staged(tmp_path):
         _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
         loser_id = _add_file(db, r"D:\B\img001.jpg", sha=None)
         _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser_id not in ids
     assert unique == 1
 
@@ -95,7 +96,7 @@ def test_done_status_skipped(tmp_path):
         _add_file(db, r"D:\A\img001.jpg", sha=SHA_A)
         loser_id = _add_file(db, r"D:\B\img001.jpg", sha=SHA_A, status="done")
         _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser_id not in ids
     assert unique == 0
 
@@ -103,20 +104,22 @@ def test_done_status_skipped(tmp_path):
 def test_multiple_pairs(tmp_path):
     db_path = tmp_path / ".photo_organizer" / "library.db"
     with Database(db_path) as db:
-        _add_file(db, r"D:\A1\img001.jpg", sha=SHA_A)
+        keeper1 = _add_file(db, r"D:\A1\img001.jpg", sha=SHA_A)
         loser1 = _add_file(db, r"D:\B1\img001.jpg", sha=SHA_A)
         _add_overlap(db, r"D:\A1", r"D:\B1", keeper="a")
 
-        _add_file(db, r"D:\A2\img001.jpg", sha=SHA_B)
+        keeper2 = _add_file(db, r"D:\A2\img001.jpg", sha=SHA_B)
         loser2 = _add_file(db, r"D:\B2\img001.jpg", sha=SHA_B)
         loser3 = _add_file(db, r"D:\B2\img002.jpg", sha=SHA_C)  # unique
         _add_overlap(db, r"D:\A2", r"D:\B2", keeper="a")
 
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser1 in ids
     assert loser2 in ids
     assert loser3 not in ids
     assert unique == 1
+    assert keeper_of[loser1] == keeper1
+    assert keeper_of[loser2] == keeper2
 
 
 def test_nested_subtree_match(tmp_path):
@@ -131,7 +134,7 @@ def test_nested_subtree_match(tmp_path):
         # Sibling folder whose name is a prefix of the loser folder — must NOT match.
         unrelated = _add_file(db, r"D:\B2\img999.jpg", sha=SHA_A)
         _add_overlap(db, r"D:\A", r"D:\B", keeper="a")
-        ids, unique = _folder_merge_loser_ids(db)
+        ids, unique, keeper_of = _folder_merge_loser_ids(db)
     assert loser_id in ids
     assert unrelated not in ids
     assert unique == 0
@@ -155,9 +158,15 @@ def test_plan_creates_stage_delete_for_loser(tmp_path):
         plan(db, target, assume_yes=True)
 
         ops = {
-            r["file_id"]: r["op_type"]
-            for r in db.conn.execute("SELECT file_id, op_type FROM operations")
+            r["file_id"]: r
+            for r in db.conn.execute(
+                "SELECT file_id, op_type, target_path, stage_reason, dupe_of_file_id "
+                "FROM operations"
+            )
         }
-        assert ops[loser_dup_id] == "STAGE_DELETE"        # duplicate staged
-        assert ops.get(loser_uniq_id) != "STAGE_DELETE"   # unique NOT staged
-        assert ops[keeper_id] == "MOVE"                   # keeper moved normally
+        assert ops[loser_dup_id]["op_type"] == "STAGE_DELETE"        # duplicate staged
+        assert ops.get(loser_uniq_id) is None or ops[loser_uniq_id]["op_type"] != "STAGE_DELETE"
+        assert ops[keeper_id]["op_type"] == "MOVE"                   # keeper moved normally
+        assert ops[loser_dup_id]["stage_reason"] == "folder_merge_loser"
+        assert ops[loser_dup_id]["dupe_of_file_id"] == keeper_id
+        assert "folder_merge" in ops[loser_dup_id]["target_path"]

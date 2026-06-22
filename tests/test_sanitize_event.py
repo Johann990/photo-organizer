@@ -15,6 +15,8 @@ Run: python -m pytest tests/test_sanitize_event.py
 
 from __future__ import annotations
 
+from datetime import date
+
 from photo_organizer.planner import _sanitize_event
 
 
@@ -49,6 +51,45 @@ def test_leading_standalone_year_stripped():
 
 def test_leading_datetime_stamp_stripped():
     assert _sanitize_event("20230615_143022 party") == "party"
+
+
+# ── Leading date glued directly to a CJK name (no separator) ─────────────────
+# Real D:\Media case: "20200112三貂嶺 小蜂" produced "2020-01-12 20200112三貂嶺_小蜂"
+# because the 8-digit date is followed by a CJK word char, not '_' or end.
+
+def test_leading_date_glued_to_cjk_stripped():
+    assert _sanitize_event("20200112三貂嶺 小蜂") == "三貂嶺_小蜂"
+
+
+def test_leading_year_glued_to_cjk_stripped():
+    assert _sanitize_event("2020貢寮浮潛") == "貢寮浮潛"
+
+
+# ── Leftover (Nd) day-count stamp from a previous organize pass ──────────────
+# Real D:\Media cases: "...(4d) 4d_台南移地訓練", "...(2d) 2d_貢寮浮潛" — the source
+# folder already carried the planner's own multi-day "(Nd)" stamp; it must be
+# stripped along with the leading date, not re-emitted into the event label.
+
+def test_leading_date_and_daycount_dashed_stripped():
+    assert _sanitize_event("2020-07-11(2d) 貢寮浮潛") == "貢寮浮潛"
+
+
+def test_leading_date_and_daycount_compact_stripped():
+    assert _sanitize_event("20200130(4d) 台南移地訓練") == "台南移地訓練"
+
+
+# ── Doubly-dated source folder (date prefix + date-glued name) ───────────────
+# Real D:\Media case: a previously-organized source folder "2020-01-12
+# 20200112三貂嶺_小蜂" carries TWO date stamps; stripping just the first leaves
+# "20200112三貂嶺". Stripping must repeat until no leading date remains.
+
+def test_two_leading_dates_both_stripped():
+    assert _sanitize_event("2020-01-12 20200112三貂嶺_小蜂") == "三貂嶺_小蜂"
+
+
+def test_leading_date_keeps_legit_cjk_number_name():
+    # A digit-led label that is NOT a date (e.g. "11月" = November) is kept.
+    assert _sanitize_event("2020-11-15 11月團集會") == "11月團集會"
 
 
 # ── Pure-date folder names collapse to empty (event segment dropped) ─────────
@@ -93,3 +134,61 @@ def test_drive_root_returns_empty():
 
 def test_result_truncated_to_40_chars():
     assert len(_sanitize_event("x" * 100)) == 40
+
+
+# ── Date-RANGE tail-day residue (the "C fix") ────────────────────────────────
+# Real D:\Media cases: "20080614~23 NICE 出差", "2019-10-19&20 屈尺當家_蜂為主",
+# "20020413_19 ..." — a source folder named as a date RANGE leaks its tail day
+# into the label once the leading 8-digit/dashed date is stripped, because the
+# generic separator-normalisation step collapses the distinguishing '~'/'&'
+# character before the leading-date stripper ever sees it ("23_NICE_出差").
+#
+# '~' and '&' are unambiguous range separators — nobody types them into an
+# event name — so they strip unconditionally, no dates required.
+# '_' and '-' on a compact date collide with this project's own NN_ numeric
+# labels ("101_煙火" — Taipei 101) and (for '_') its "(Nd)" day-count residue,
+# so they only strip when the caller supplies `date_range` (the folder's
+# actual EXIF date span) AND the tail, read as a day-of-month, exactly
+# matches the real max date.
+
+def test_date_range_tilde_separator_stripped_unconditionally():
+    assert _sanitize_event("20080614~23 NICE 出差") == "NICE_出差"
+
+
+def test_date_range_ampersand_separator_on_dashed_date_stripped_unconditionally():
+    assert _sanitize_event("2019-10-19&20 屈尺當家_蜂為主") == "屈尺當家_蜂為主"
+
+
+def test_date_range_underscore_separator_stripped_when_dates_corroborate():
+    date_range = (date(2002, 4, 13), date(2002, 4, 19))
+    assert _sanitize_event("20020413_19 清水溪", date_range) == "清水溪"
+
+
+def test_date_range_underscore_separator_kept_without_date_range():
+    # No date context supplied — conservative, unchanged from today's behavior.
+    assert _sanitize_event("20020413_19 清水溪") == "19_清水溪"
+
+
+def test_date_range_underscore_separator_kept_when_dates_dont_corroborate():
+    # Tail day 19 is NOT actually the folder's max date — don't trust it.
+    date_range = (date(2002, 4, 13), date(2002, 4, 15))
+    assert _sanitize_event("20020413_19 清水溪", date_range) == "19_清水溪"
+
+
+def test_date_range_month_rollover_corroborated():
+    # 6/28 ~ 7/3 rolls into the next month; '~' is unconditional anyway, but
+    # this exercises the rollover arithmetic via the ambiguous '_' separator.
+    date_range = (date(2008, 6, 28), date(2008, 7, 3))
+    assert _sanitize_event("20080628_3 NICE 出差", date_range) == "NICE_出差"
+
+
+def test_date_range_does_not_break_space_separated_taipei101():
+    # "20060719 101 煙火" — a SPACE precedes "101", not a glued separator, so
+    # this never matches the range-tail pattern at all (must stay untouched).
+    assert _sanitize_event("20060719 101 煙火") == "101_煙火"
+
+
+def test_date_range_dash_separator_kept_without_corroboration():
+    # '-' on a compact date is ambiguous too ("19980101-5次旅行" is a real
+    # label, not a range) — same conservative default as '_'.
+    assert _sanitize_event("20080614-23 NICE 出差") == "23_NICE_出差"

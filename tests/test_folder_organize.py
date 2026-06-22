@@ -421,6 +421,66 @@ def test_per_day_candidate_listed(tmp_path):
         assert root in roots
 
 
+def test_year_filter_scopes_no_event_folders_by_path_segment(tmp_path):
+    # No-event / low-date folders often have NO reliable EXIF year (that's
+    # the whole point) — --year scopes these by the file's CURRENT path
+    # containing the year as a folder segment (".../Masters/2020/...", or
+    # here pre-execute ".../2012/..."), not by datetime_original.
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        f2012 = r"D:\DCIM\2012\100EOS5D"
+        f2015 = r"D:\DCIM\2015\100EOS5D"
+        _add_file(
+            db, f2012 + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+        )
+        _add_file(
+            db, f2015 + r"\IMG_0001.jpg",
+            datetime_original="2015:09:08 10:00:00", date_confidence="HIGH",
+        )
+        folders_2012 = {f["folder"] for f in FolderOrganizeState(db, year="2012").folders}
+        folders_2015 = {f["folder"] for f in FolderOrganizeState(db, year="2015").folders}
+    assert folders_2012 == {f2012}
+    assert folders_2015 == {f2015}
+
+
+def test_year_filter_excludes_folder_with_no_year_segment(tmp_path):
+    # A folder with no year anywhere in its path can't be attributed to any
+    # year by this scoping — it must be excluded from a --year-scoped view
+    # (it still shows up unscoped, see test_candidate_includes_no_event_folder).
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        folder = r"D:\DCIM\100EOS5D"
+        _add_file(
+            db, folder + r"\IMG_0001.jpg",
+            datetime_original="2012:09:08 10:00:00", date_confidence="HIGH",
+        )
+        folders = {f["folder"] for f in FolderOrganizeState(db, year="2012").folders}
+    assert folder not in folders
+
+
+def test_year_filter_forwarded_to_subject_candidates(tmp_path):
+    from photo_organizer.folderorganize import FolderOrganizeState
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        roots_2021 = {c["event_folder"] for c in
+                      FolderOrganizeState(db, year="2021").subject_candidates}
+        roots_2020 = {c["event_folder"] for c in
+                      FolderOrganizeState(db, year="2020").subject_candidates}
+    assert root not in roots_2021
+    assert root in roots_2020
+
+
 def test_state_forwards_scan_roots_to_detect(tmp_path):
     # Wiring guard: day-serial subfolders sitting DIRECTLY under a scan root
     # resolve UP to the scan root, which the detect guard excludes — but only
@@ -640,5 +700,148 @@ def test_per_day_cards_marked_and_saveall_excludes_them(tmp_path):
             # per-day cards carry the data-pd marker; saveAll excludes them
             assert 'data-pd="1"' in body
             assert ".card:not([data-pd])" in body
+        finally:
+            httpd.shutdown()
+
+
+def test_subject_candidate_listed(tmp_path):
+    from photo_organizer.folderorganize import FolderOrganizeState
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        st = FolderOrganizeState(db)
+        roots = {c["event_folder"] for c in st.subject_candidates}
+        assert root in roots
+
+
+def test_post_subject_confirm_saves(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({"source_folder": root, "confirmed_subject": 1}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            assert db.get_folder_overrides()[root]["confirmed_subject"] == 1
+        finally:
+            httpd.shutdown()
+
+
+def test_subject_confirm_does_not_clobber_event_name(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        db.set_folder_override(root, event_name="Dump", updated_at="2026-06-21T00:00:00+00:00")
+        db.commit()
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            port = httpd.server_address[1]
+            payload = json.dumps({"source_folder": root, "confirmed_subject": 1}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/folder-override",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json", "Host": "127.0.0.1",
+                         "Content-Length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+            ov = db.get_folder_overrides()[root]
+            assert ov["confirmed_subject"] == 1
+            assert ov["event_name"] == "Dump"   # NOT clobbered
+        finally:
+            httpd.shutdown()
+
+
+def test_split_reminder_hint_mentions_sync_for_already_organized_case(tmp_path):
+    # The read-only "scattered multi-day" reminder used to point ONLY at the
+    # pre-execute relocate -> plan workflow. Since P2 (sync.py) shipped, a
+    # folder that's already execute'd (sitting in Masters/Others) should
+    # instead be told to use `sync rename`/`sync move` (reversible via
+    # `undo --op-type RENAME`) — relocate/plan is for the not-yet-executed
+    # case only.
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2012:09:01 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2012:09:02 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\c.jpg",
+                  datetime_original="2012:09:20 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{httpd.server_address[1]}/").read().decode()
+            assert "sync rename" in body or "sync move" in body
+            assert "undo" in body
+            assert "relocate" in body  # still mentioned, for the pre-execute case
+        finally:
+            httpd.shutdown()
+
+
+def test_subject_hint_mentions_sync_for_already_organized_case(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{httpd.server_address[1]}/").read().decode()
+            assert "sync rename" in body or "sync move" in body
+            assert "undo" in body
+            assert "relocate" in body
+        finally:
+            httpd.shutdown()
+
+
+def test_subject_cards_marked_and_saveall_excludes_them(tmp_path):
+    import urllib.request
+    from photo_organizer.folderorganize import serve
+
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        root = r"D:\Raw\Mixed Dump"
+        _add_file(db, root + r"\a.jpg",
+                  datetime_original="2019:12:31 10:00:00", date_confidence="HIGH")
+        _add_file(db, root + r"\b.jpg",
+                  datetime_original="2020:02:02 10:00:00", date_confidence="HIGH")
+        httpd = serve(db, port=0, open_browser=False, background=True)
+        try:
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{httpd.server_address[1]}/").read().decode()
+            assert 'data-subj="1"' in body
+            assert ".card:not([data-pd]):not([data-subj])" in body
         finally:
             httpd.shutdown()

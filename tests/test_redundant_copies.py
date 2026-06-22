@@ -20,7 +20,19 @@ Run: python -m pytest tests/test_redundant_copies.py
 from __future__ import annotations
 
 from photo_organizer.db import Database
-from photo_organizer.planner import plan, redundant_copy_ids
+from photo_organizer.planner import _redundant_copy_keeper_map, plan, redundant_copy_ids
+
+
+def test_keeper_map_records_which_file_is_duplicated(tmp_path):
+    """_redundant_copy_keeper_map must expose WHICH keeper each loser duplicates,
+    not just the loser set (redundant_copy_ids stays a thin set-only wrapper)."""
+    with Database(tmp_path / "p.db") as db:
+        _add(db, 1, "IMG_1.jpg", w=6000, h=4000, dt="2020:01:01 10:00:00")
+        _add(db, 2, "IMG_1.jpg", w=1920, h=1280, dt="2020:01:01 10:00:00",
+             path="/b/IMG_1.jpg")
+        db.commit()
+        assert _redundant_copy_keeper_map(db) == {2: 1}
+        assert redundant_copy_ids(db) == {2}
 
 
 def _add(db, fid, filename, *, w, h, dt, sha=None, phash=None,
@@ -304,10 +316,14 @@ def test_plan_stages_unique_sha_redundant_copy(tmp_path):
         plan(db, tmp_path / "out", assume_yes=True)
 
         ops = {
-            r["file_id"]: r["op_type"]
+            r["file_id"]: r
             for r in db.conn.execute(
-                "SELECT file_id, op_type FROM operations"
+                "SELECT file_id, op_type, target_path, stage_reason, dupe_of_file_id "
+                "FROM operations"
             ).fetchall()
         }
-        assert ops[2] == "STAGE_DELETE", "redundant copy must be staged"
-        assert ops[1] == "MOVE", "better copy must be kept and moved"
+        assert ops[2]["op_type"] == "STAGE_DELETE", "redundant copy must be staged"
+        assert ops[1]["op_type"] == "MOVE", "better copy must be kept and moved"
+        assert ops[2]["stage_reason"] == "redundant_copy"
+        assert ops[2]["dupe_of_file_id"] == 1
+        assert "redundant_copy" in ops[2]["target_path"]

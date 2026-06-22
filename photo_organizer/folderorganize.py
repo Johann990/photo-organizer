@@ -47,20 +47,23 @@ def _now() -> str:
 
 
 def _merge_override(existing, payload):
-    """Resolve (event_name, date_override, per_day_split) for an upsert, taking
-    each field from the payload when present, else preserving the existing row."""
+    """Resolve (event_name, date_override, per_day_split, confirmed_subject) for
+    an upsert, taking each field from the payload when present, else preserving
+    the existing row."""
     def _str_field(name):
         if name in payload:
             v = payload.get(name)
             return (v.strip() or None) if isinstance(v, str) else (v or None)
         return existing[name] if existing else None
+    def _bool_field(name):
+        if name in payload:
+            return int(payload[name] or 0)
+        return existing[name] if existing else 0
     ev = _str_field("event_name")
     dt = _str_field("date_override")
-    if "per_day_split" in payload:
-        pds = int(payload["per_day_split"] or 0)
-    else:
-        pds = existing["per_day_split"] if existing else 0
-    return ev, dt, pds
+    pds = _bool_field("per_day_split")
+    cs = _bool_field("confirmed_subject")
+    return ev, dt, pds, cs
 
 
 # -----------------------------------------------------------------------
@@ -178,7 +181,7 @@ function clearFolder(folder) {
   }).then(r => { if (r.ok) setSaved(folder, false); });
 }
 function saveAll() {
-  const cards = document.querySelectorAll('.card:not([data-pd])');
+  const cards = document.querySelectorAll('.card:not([data-pd]):not([data-subj])');
   const overrides = [];
   cards.forEach(el => overrides.push(readCard(el.dataset.folder)));
   const msg = document.getElementById('allmsg');
@@ -209,6 +212,16 @@ function savePerDay(btn){
       card.querySelector('.saved').textContent = j.ok ? '\\u2713 saved' : 'error';
     });
 }
+function saveSubjectConfirm(btn){
+  const card = btn.closest('.card');
+  const folder = card.dataset.folder;
+  fetch('/folder-override', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({source_folder: folder, confirmed_subject: 1})})
+    .then(r => r.json()).then(j => {
+      if (j.ok) { card.style.display = 'none'; }
+    });
+}
 """
 
 
@@ -219,7 +232,9 @@ function savePerDay(btn){
 class FolderOrganizeState:
     """Loaded once at server start: candidate folders needing attention."""
 
-    def __init__(self, db: Database, scan_roots: list | None = None) -> None:
+    def __init__(
+        self, db: Database, scan_roots: list | None = None, year: str | None = None,
+    ) -> None:
         staged = {
             row[0] for row in
             db.conn.execute("SELECT file_id FROM operations WHERE op_type='STAGE_DELETE'")
@@ -233,6 +248,14 @@ class FolderOrganizeState:
             if r["file_id"] in staged:
                 continue
             folder = str(PureWindowsPath(r["path"]).parent)
+            # No-event / low-date folders often have no reliable EXIF year (the
+            # whole reason they're flagged), so --year scopes by the file's
+            # CURRENT path containing the year as a folder segment instead of
+            # datetime_original — works pre- AND post-execute (".../2012/...",
+            # ".../Masters/2020/..."). A folder with no year anywhere in its
+            # path can't be attributed to a year and is excluded when scoped.
+            if year and year not in PureWindowsPath(r["path"]).parts:
+                continue
             by_folder[folder].append(dict(r))
 
         overrides = db.get_folder_overrides()
@@ -308,12 +331,18 @@ class FolderOrganizeState:
         # scan root as an event" guard in both detect_* helpers never fires and
         # the suggestions diverge from what `plan` (which always passes roots)
         # actually does. Forward the configured input_dirs.
-        from .planner import detect_multiday_needing_split, detect_per_day_events
+        from .planner import (
+            detect_multiday_needing_split,
+            detect_per_day_events,
+            detect_subjects_needing_confirmation,
+        )
         self._overrides = overrides
-        self.per_day_candidates = detect_per_day_events(db, scan_roots)
+        self.per_day_candidates = detect_per_day_events(db, scan_roots, year=year)
         _pd_roots = {c["event_folder"] for c in self.per_day_candidates}
         self.split_reminders = detect_multiday_needing_split(
-            db, scan_roots, exclude=_pd_roots)
+            db, scan_roots, exclude=_pd_roots, year=year)
+        self.subject_candidates = detect_subjects_needing_confirmation(
+            db, scan_roots, year=year)
 
     def _build_groups(self) -> list[dict]:
         """Group candidate folders by their parent ("mother") folder so runs
@@ -453,15 +482,48 @@ def _per_day_section_html(state: FolderOrganizeState) -> str:
             '<details class="group"><summary class="ghead">'
             f'&#9888; 多日且日期分散的資料夾&#65288;可能混了不同活動&#65289; &mdash; {len(state.split_reminders)}'
             f'</summary><ul class="samples">{items}{more}</ul>'
-            '<p class="sub">若想把不同活動分開&#65306;在檔案總管拆夾 &rarr; <b>relocate</b> &rarr; <b>plan</b>。</p>'
+            '<p class="sub">若想把不同活動分開&#65306;在檔案總管拆夾&#65292;然後&mdash;'
+            '還沒 <b>execute</b> &#65288;仍在來源資料夾&#65289;&#65306;'
+            '<b>relocate</b> &rarr; <b>plan</b>&#65307;'
+            '已經 <b>execute</b> &#65288;已落在 Masters&#47;Others&#65289;&#65306;'
+            '<b>sync rename</b> &#47; <b>sync move</b>'
+            '&#65288;可用 <b>undo --op-type RENAME</b> 復原&#65289;。</p>'
             '</details>'
         )
-    return pd_html + rem_html
+    subj_html = ""
+    if state.subject_candidates:
+        cards = []
+        for c in state.subject_candidates:
+            root = c["event_folder"]
+            cards.append(
+                f'<div class="card" data-subj="1" data-folder="{html.escape(root, quote=True)}">'
+                f'<div class="path">&#128193; {html.escape(root)} '
+                f'<span class="tag">{html.escape(c["label"])}</span></div>'
+                f'<div class="stats">{c["date_lo"]} &hellip; {c["date_hi"]} '
+                f'&middot; {c["span"]} 天跨度 &middot; {c["days"]} 個日期</div>'
+                f'<button onclick="saveSubjectConfirm(this)">&#10003; 確認是同一主題</button>'
+                f'<span class="saved"></span>'
+                f'</div>'
+            )
+        subj_html = (
+            '<details class="group" open><summary class="ghead">'
+            f'&#9888; 自動歸類為主題收藏,請確認 &mdash; {len(state.subject_candidates)}'
+            '</summary>' + "".join(cards) +
+            '<p class="sub">跨度超過 30 天的命名資料夾預設當成長期主題(依年份分夾)。'
+            '若這其實是混了不同場合(例如平時練習+一次出遊),請在檔案總管拆開,然後&mdash;'
+            '還沒 <b>execute</b>&#65306;<b>relocate</b> &rarr; <b>plan --force</b>;'
+            '已經 <b>execute</b>&#65306;<b>sync rename</b> &#47; <b>sync move</b>'
+            '&#65288;可用 <b>undo --op-type RENAME</b> 復原&#65289;;'
+            '確實是同一主題就按右側按鈕,以後不再提醒。</p>'
+            '</details>'
+        )
+    return pd_html + rem_html + subj_html
 
 
 def _render_page(state: FolderOrganizeState) -> bytes:
     total = state.total()
-    if total == 0 and not state.per_day_candidates and not state.split_reminders:
+    if (total == 0 and not state.per_day_candidates and not state.split_reminders
+            and not state.subject_candidates):
         body = '<p class="sub">No folders need attention. Run plan to see the result.</p>'
         actionbar = ""
     else:
@@ -559,10 +621,11 @@ def _make_handler(state: FolderOrganizeState):
                         for d in payload.get("overrides", []):
                             source_folder = str(d["source_folder"])
                             existing = state.db.get_folder_overrides().get(source_folder)
-                            ev, dt, pds = _merge_override(existing, d)
+                            ev, dt, pds, cs = _merge_override(existing, d)
                             state.db.set_folder_override(
                                 source_folder, event_name=ev, date_override=dt,
-                                per_day_split=pds, note=None, updated_at=now,
+                                per_day_split=pds, confirmed_subject=cs,
+                                note=None, updated_at=now,
                             )
                             saved += 1
                         state.db.commit()
@@ -577,10 +640,11 @@ def _make_handler(state: FolderOrganizeState):
                 source_folder = str(payload["source_folder"])
                 with state.lock:
                     existing = state.db.get_folder_overrides().get(source_folder)
-                    ev, dt, pds = _merge_override(existing, payload)
+                    ev, dt, pds, cs = _merge_override(existing, payload)
                     state.db.set_folder_override(
                         source_folder, event_name=ev, date_override=dt,
-                        per_day_split=pds, note=None, updated_at=_now(),
+                        per_day_split=pds, confirmed_subject=cs,
+                        note=None, updated_at=_now(),
                     )
                     state.db.commit()
                 self._send(200, b'{"ok":true}', "application/json")
@@ -606,6 +670,7 @@ def serve(
     open_browser: bool = True,
     background: bool = False,
     scan_roots: list | None = None,
+    year: str | None = None,
 ) -> ThreadingHTTPServer:
     """Start the local folder-organize review server.
 
@@ -615,8 +680,11 @@ def serve(
 
     scan_roots (the configured input_dirs) bounds event-folder resolution so the
     per-day suggestions match what `plan` produces; see FolderOrganizeState.
+
+    year (e.g. "2020") scopes candidates to one year at a time — batching P3
+    triage instead of facing the whole library at once; see FolderOrganizeState.
     """
-    state = FolderOrganizeState(db, scan_roots)
+    state = FolderOrganizeState(db, scan_roots, year)
     httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     actual_port = httpd.server_address[1]
     url = f"http://{host}:{actual_port}/"

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -54,7 +54,13 @@ def _parse_mtime(s: str | None) -> datetime | None:
     Parse the stored filesystem mtime (ISO-8601, e.g. '2023-06-15T10:30:00+00:00').
     Used only as a LAST-RESORT date when a file has no EXIF date — mtime can be
     unreliable (copying may reset it), so it is preferred over NoDate/ but always
-    logged.  Returns a naive datetime (tz dropped) to match _parse_exif_dt.
+    logged. Returns a naive datetime (tz dropped) to match _parse_exif_dt.
+
+    The stored value is UTC-aware (scanner.py uses datetime.fromtimestamp(...,
+    tz=timezone.utc)) — it must be converted to the LOCAL calendar day before the
+    tz label is dropped, or any file modified between local midnight and the
+    local UTC offset (e.g. 00:00-08:00 in UTC+8) resolves to the PREVIOUS day,
+    silently disagreeing with what Explorer / the OS show for that same file.
     """
     if not s:
         return None
@@ -62,6 +68,8 @@ def _parse_mtime(s: str | None) -> datetime | None:
         dt = datetime.fromisoformat(s)
     except ValueError:
         return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
     return dt.replace(tzinfo=None)
 
 
@@ -329,11 +337,15 @@ _LEADING_DATE = re.compile(
     r"|\d{4}_\d{4}"           # 2010_2012  (year range)
     r"|\d{4}(?:_\d{2}){1,2}"  # 2010_08 / 2010_08_15
     r"|\d{4}"                 # 2012  (standalone year)
-    r")(?=_|$)"
+    r")"
+    r"(?:_?\d{1,2}d)?"        # leftover "(Nd)" day-count from a prior organize
+    r"(?=_|$|[^\x00-\x7f])"   # date may butt straight up against a CJK name
 )
 
 
-def _sanitize_event(folder_name: str | None) -> str:
+def _sanitize_event(
+    folder_name: str | None, date_range: tuple[date, date] | None = None
+) -> str:
     """
     Filesystem-safe, truncated 'event & location' string derived from the
     source file's parent folder name.  Returns "" when unusable (empty or a
@@ -342,17 +354,79 @@ def _sanitize_event(folder_name: str | None) -> str:
     The date is always added separately as the folder PREFIX
     ({YYYY-MM-DD}_{event}), so a leading date stamp inside the source folder
     name is redundant and is stripped — "20100815 倩家" → "倩家", "2012 Trip"
-    → "Trip".  Separator runs (including literal underscores, since '_' is a
-    word char) collapse to a single '_'.
+    → "Trip".  The date is also stripped when it butts straight up against a
+    CJK name with no separator ("20200112三貂嶺" → "三貂嶺"), and a leftover
+    "(Nd)" day-count stamp from a previous organize pass is stripped with it
+    ("20200711(2d) 貢寮" → "貢寮"), so re-organizing never re-embeds the prefix.
+    Separator runs (including literal underscores, since '_' is a word char)
+    collapse to a single '_'.
+
+    A leading date-RANGE stamp ("20080614~23 NICE 出差", "2019-10-19&20 屈尺")
+    is also stripped — see `_strip_date_range_tail` for how '~'/'&' (always)
+    vs '_'/'-' (only when `date_range` corroborates the tail day) are told
+    apart from a real short numeric label ("101_煙火" — Taipei 101).
     """
     if not folder_name:
         return ""
     # A drive-root parent (e.g. "E:\\") has no real name component.
     if re.fullmatch(r"[A-Za-z]:[\\/]?", folder_name):
         return ""
+    folder_name = _strip_date_range_tail(folder_name, date_range)
     s = re.sub(r"[\W_]+", "_", folder_name).strip("_")
-    s = _LEADING_DATE.sub("", s).strip("_")
+    # Strip leading date/day-count tokens repeatedly: a previously-organised
+    # source folder can carry more than one (e.g. a "{YYYY-MM-DD} {YYYYMMDD}…"
+    # prefix), and a single pass would leave the inner one behind.
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LEADING_DATE.sub("", s).strip("_")
     return s[:40]
+
+
+_DATE_RANGE_COMPACT = re.compile(r"^(\d{4})(\d{2})(\d{2})([~&_-])(\d{1,2})(?=\D|$)")
+_DATE_RANGE_DASHED = re.compile(r"^(\d{4})-(\d{2})-(\d{2})([~&_])(\d{1,2})(?=\D|$)")
+_UNAMBIGUOUS_RANGE_SEPS = frozenset("~&")
+
+
+def _range_tail_end_date(year: int, month: int, day1: int, tail: int) -> date | None:
+    """The date `tail` denotes when read as a day-of-month continuing from
+    (year, month, day1) — rolling into next month when tail < day1 (e.g.
+    6/28 ~ 7/3). None if the result isn't a real calendar date."""
+    if tail < day1:
+        month, year = (month + 1, year) if month < 12 else (1, year + 1)
+    try:
+        return date(year, month, tail)
+    except ValueError:
+        return None
+
+
+def _strip_date_range_tail(name: str, date_range: tuple[date, date] | None) -> str:
+    """Strip a leading date-RANGE stamp before the rest of _sanitize_event
+    ever sees it — the generic separator-normalisation step would otherwise
+    collapse the distinguishing '~'/'&' character and leave the tail day
+    glued to the label ("23_NICE_出差").
+
+    '~' and '&' are unambiguous: nobody types them into an event name, so
+    they strip unconditionally, no dates needed. '_' and '-' on a compact
+    date are ambiguous with a real short numeric label ("101_煙火" — Taipei
+    101) or (for '_') this project's own "(Nd)" day-count residue, so they
+    only strip when `date_range` is given AND the tail, read as a
+    day-of-month, exactly matches the folder's actual max date.
+    """
+    for pattern in (_DATE_RANGE_COMPACT, _DATE_RANGE_DASHED):
+        m = pattern.match(name)
+        if not m:
+            continue
+        year, month, day1, sep, tail = m.groups()
+        year, month, day1, tail = int(year), int(month), int(day1), int(tail)
+        if sep not in _UNAMBIGUOUS_RANGE_SEPS:
+            if not date_range:
+                continue
+            end = _range_tail_end_date(year, month, day1, tail)
+            if end is None or end != date_range[1]:
+                continue
+        return name[m.end():]
+    return name
 
 
 def _is_unorganised_folder_name(name: str | None) -> bool:
@@ -553,7 +627,7 @@ def _compute_event_groups(
     from collections import defaultdict as _dd
 
     dates_by_folder: dict[str, list] = _dd(list)
-    label_by_folder: dict[str, str] = {}
+    folder_name_by_key: dict[str, str] = {}
     for batch in db.iter_files():
         for row in batch:
             if row["status"] == "error" or row["file_id"] in stage_ids:
@@ -570,13 +644,15 @@ def _compute_event_groups(
                 continue  # no real label → per-day / no-event fallback
             key = str(folder)
             dates_by_folder[key].append(dt.date())
-            label_by_folder.setdefault(key, _sanitize_event(folder.name))
+            folder_name_by_key.setdefault(key, folder.name)
 
     groups: dict[str, dict] = {}
     for key, dates in dates_by_folder.items():
         dmin, dmax = min(dates), max(dates)
         span = (dmax - dmin).days + 1
-        label = label_by_folder[key]
+        # date_range lets _sanitize_event verify an ambiguous date-RANGE
+        # tail (e.g. "20020413_19") against this folder's actual EXIF span.
+        label = _sanitize_event(folder_name_by_key[key], (dmin, dmax))
         if span > MAX_EVENT_SPAN_DAYS:
             groups[key] = {"kind": "subject", "label": label}
             db.log(
@@ -592,13 +668,22 @@ def _compute_event_groups(
     return groups
 
 
-def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) -> list[dict]:
+def detect_per_day_events(
+    db: Database, scan_roots: list[Path] | None = None, year: str | None = None,
+) -> list[dict]:
     """DB-only. Find event-root folders already organized into per-day subfolders:
     >=2 photo subfolders, each >=_PER_DAY_DOMINANCE a single day, days spanning
     >=2 and roughly consecutive (adjacent gap <= _EVENT_DAY_GAP), total span <=
     MAX_EVENT_SPAN_DAYS. Returns [{event_folder, days:[date], span:int,
     subfolders:[str]}], a suggestion list for review --organize (user opts in via
-    per_day_split). No disk reads."""
+    per_day_split). No disk reads.
+
+    `year` (e.g. "2020") scopes the result to candidates with ANY day in that
+    year — for batching P3 triage one year at a time instead of facing the
+    whole library at once. It filters the OUTPUT, not the per-file ingestion:
+    a candidate's span/days are computed exactly as without `year`, so a
+    candidate spanning a year boundary still appears (whole) for either of
+    its two years rather than having its span silently recomputed/shrunk."""
     # Never treat a scan root itself as an event: serial/camera-dump subfolders
     # sitting directly under a scan root resolve UP to the root, which would
     # otherwise masquerade as a per-day event (event name = the root's name).
@@ -649,6 +734,8 @@ def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) ->
         gaps = [(days[i + 1] - days[i]).days for i in range(len(days) - 1)]
         if any(g > _EVENT_DAY_GAP for g in gaps):
             continue
+        if year and not any(d.strftime("%Y") == year for d in days):
+            continue
         out.append({
             "event_folder": root,
             "days": days,
@@ -660,14 +747,19 @@ def detect_per_day_events(db: Database, scan_roots: list[Path] | None = None) ->
 
 
 def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = None,
-                                  exclude: set[str] | None = None) -> list[dict]:
+                                  exclude: set[str] | None = None,
+                                  year: str | None = None) -> list[dict]:
     """Event roots whose confident photos span multiple days with a SCATTERED /
     non-contiguous date profile (at least one adjacent-day gap > _EVENT_DAY_GAP)
     and are NOT already day-organized — i.e. likely several different occasions
     dumped together, worth a manual look. A coherent contiguous trip (all gaps
     <= _EVENT_DAY_GAP) is filed fine flat and is NOT flagged. Excludes scan roots
     and any folder in `exclude` (typically the detect_per_day_events results).
-    DB-only. Returns [{event_folder, days:int, span:int}] sorted by -span."""
+    DB-only. Returns [{event_folder, days:int, span:int}] sorted by -span.
+
+    `year` scopes the result to candidates with ANY day in that year — see
+    detect_per_day_events for why this filters the output (touches-this-year)
+    rather than recomputing span from a year-restricted file subset."""
     exclude = exclude or set()
     root_set = {str(Path(r)) for r in (scan_roots or [])}
     days_by_root: dict[str, set] = defaultdict(set)
@@ -700,7 +792,82 @@ def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = 
         gaps = [(ds[i + 1] - ds[i]).days for i in range(len(ds) - 1)]
         if all(g <= _EVENT_DAY_GAP for g in gaps):
             continue  # contiguous trip → coherent event, filed fine flat, skip
+        if year and not any(d.strftime("%Y") == year for d in ds):
+            continue
         out.append({"event_folder": r, "days": len(ds), "span": span})
+    out.sort(key=lambda c: -c["span"])
+    return out
+
+
+def detect_subjects_needing_confirmation(
+    db: Database, scan_roots: list[Path] | None = None, year: str | None = None,
+) -> list[dict]:
+    """Event roots that `_compute_event_groups` would auto-classify as a
+    'subject' collection (named folder, confident-photo span > MAX_EVENT_SPAN_DAYS)
+    and have not yet been confirmed via folder_overrides.confirmed_subject.
+
+    Why: a named folder spanning >30 days is assumed to be a recurring subject
+    (a child, a pet, a place revisited) and is organised as {label}/{year}/ —
+    but a folder that just mixes two unrelated short occasions (e.g. routine
+    practice photos dumped alongside a 2-day trip) can accidentally clear the
+    same 30-day bar and silently inherit one misleading label for everything.
+    Surfacing it in `review --organize` lets a human confirm intent before
+    that happens; confirming only records the decision — it does NOT change
+    `plan`'s classification, which still always treats span > MAX_EVENT_SPAN_DAYS
+    as a subject either way (see review --organize's "未確認 Subject" section).
+
+    Uses the same confident-dates-only filter as detect_per_day_events /
+    detect_multiday_needing_split (HIGH/MEDIUM EXIF only — mtime-only dates are
+    too uncertain to drive this judgment). DB-only. Returns
+    [{event_folder, label, span, days, date_lo, date_hi}] sorted by -span.
+
+    `year` scopes the result to candidates with ANY day in that year (a
+    candidate can itself span a year boundary, e.g. Dec 31 .. Feb 2 — it then
+    appears, unchanged, for either of its two years rather than having its
+    span recomputed/shrunk from a year-restricted subset)."""
+    confirmed = {
+        sf for sf, row in db.get_folder_overrides().items()
+        if row["confirmed_subject"]
+    }
+    root_set = {str(Path(r)) for r in (scan_roots or [])}
+    dates_by_root: dict[str, list[date]] = defaultdict(list)
+    folder_name_by_root: dict[str, str] = {}
+    for batch in db.iter_files():
+        for row in batch:
+            if row["status"] == "error":
+                continue
+            if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
+                continue
+            if row["date_confidence"] not in ("HIGH", "MEDIUM"):
+                continue
+            dt = _parse_exif_dt(row["datetime_original"])
+            if dt is None:
+                continue
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            if resolved is None:
+                continue
+            r = str(resolved)
+            if r in root_set or r in confirmed:
+                continue
+            dates_by_root[r].append(dt.date())
+            folder_name_by_root.setdefault(r, resolved.name)
+
+    out: list[dict] = []
+    for r, dates in dates_by_root.items():
+        dmin, dmax = min(dates), max(dates)
+        label = _sanitize_event(folder_name_by_root[r], (dmin, dmax))
+        if not label:
+            continue  # no usable label → not a subject candidate
+        span = (dmax - dmin).days + 1
+        if span <= MAX_EVENT_SPAN_DAYS:
+            continue  # within plan's normal multi-day window, not a subject
+        if year and not any(d.strftime("%Y") == year for d in dates):
+            continue
+        out.append({
+            "event_folder": r, "label": label, "span": span,
+            "days": len(set(dates)),
+            "date_lo": dmin.isoformat(), "date_hi": dmax.isoformat(),
+        })
     out.sort(key=lambda c: -c["span"])
     return out
 
@@ -812,6 +979,17 @@ _RESIZE_ASPECT_TOL = 0.02
 # content-equality decision.  Shared with reviewer's near-cluster junk filter.
 JUNK_PHASH_MIN_FILES = 8
 
+# Where a STAGE_DELETE'd file lands under _staging/to_delete/, keyed by
+# stage_reason — splits the staging area by WHY a file was staged, instead of
+# dumping everything flat (too many files in one folder causes its own problems).
+_STAGE_SUBFOLDER = {
+    "resized_jpeg": "resized_jpeg",
+    "exact_dupe": "exact_dupe",
+    "near_dupe": "near_dupe",
+    "redundant_copy": "redundant_copy",
+    "folder_merge_loser": "folder_merge",
+}
+
 # Folder-name tokens that mark a throwaway export / derivative copy.  A path
 # component is a "derivative folder" when, split on non-alphanumerics, any of its
 # tokens is in this set (so "resize+crop" matches via {resize, crop}).  "jpeg" is
@@ -846,6 +1024,16 @@ def _derivative_event_root(path: Path) -> str | None:
 
 def redundant_copy_ids(db: Database) -> set[int]:
     """file_ids that are redundant copies of a shot whose better version survives.
+
+    Thin wrapper over `_redundant_copy_keeper_map` for callers (reviewer.py,
+    existing tests) that only need the loser set, not which keeper each loser
+    duplicates.
+    """
+    return set(_redundant_copy_keeper_map(db).keys())
+
+
+def _redundant_copy_keeper_map(db: Database) -> dict[int, int]:
+    """Map every redundant-copy loser file_id -> the keeper it duplicates.
 
     Copies of one shot are linked into a connected component, then the keep_score
     best of each component is KEPT and every other member is staged.  Two edges
@@ -947,24 +1135,28 @@ def redundant_copy_ids(db: Database) -> set[int]:
     for fid in parent:
         components[find(fid)].append(fid)
 
-    losers: set[int] = set()
+    keeper_of: dict[int, int] = {}
     for members in components.values():
         if len(members) < 2:
             continue
         keeper = max(members, key=lambda f: keep_score(meta[f], known))
-        losers.update(f for f in members if f != keeper)
+        for f in members:
+            if f != keeper:
+                keeper_of[f] = keeper
 
     # Folder rule — derivative-export copies with a same-stem master in-event.
-    # Index every NON-derivative file's parent dir by stem (RAW counts as a
-    # master), then stage any derivative-folder JPEG whose event root contains a
-    # same-stem master.  Independent of pHash/date, so it catches stripped-date,
-    # cropped, and cross-shot-colliding exports the edges above can't place.
-    masters_by_stem: dict[str, list[str]] = defaultdict(list)
-    for r in db.conn.execute("SELECT filename, path FROM files"):
+    # Index every NON-derivative file's parent dir (and file_id) by stem (RAW
+    # counts as a master), then stage any derivative-folder JPEG whose event
+    # root contains a same-stem master.  Independent of pHash/date, so it
+    # catches stripped-date, cropped, and cross-shot-colliding exports the
+    # edges above can't place.  setdefault: a file already linked via the
+    # edges above keeps that more precise keeper.
+    masters_by_stem: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for r in db.conn.execute("SELECT file_id, filename, path FROM files"):
         p = Path(r["path"])
         if _derivative_event_root(p) is None:  # a master lives outside such folders
             stem = Path(r["filename"]).stem.strip().lower()
-            masters_by_stem[stem].append(str(p.parent).lower())
+            masters_by_stem[stem].append((str(p.parent).lower(), r["file_id"]))
     # Candidate query is separate from `rows`: derivative exports often have their
     # EXIF date stripped (so they fail the datetime filter), but the folder rule
     # doesn't need a date.
@@ -977,18 +1169,24 @@ def redundant_copy_ids(db: Database) -> set[int]:
         if root is None:
             continue
         stem = Path(r["filename"]).stem.strip().lower()
-        if any(d.startswith(root) for d in masters_by_stem.get(stem, ())):
-            losers.add(r["file_id"])
+        match = next(
+            (fid for d, fid in masters_by_stem.get(stem, ()) if d.startswith(root)),
+            None,
+        )
+        if match is not None:
+            keeper_of.setdefault(r["file_id"], match)
 
-    return losers
+    return keeper_of
 
 
-def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
-    """Return (loser_file_ids_to_stage, unique_to_loser_count).
+def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int, dict[int, int]]:
+    """Return (loser_file_ids_to_stage, unique_to_loser_count, keeper_of).
 
     For each reviewed folder_overlap with a keeper:
     - Files in the loser subtree whose SHA-256 exists in the keeper subtree
-      → returned in loser_ids (to be STAGE_DELETE'd by plan).
+      → returned in loser_ids (to be STAGE_DELETE'd by plan); keeper_of maps
+      each such loser's file_id to the keeper-subtree file_id sharing its
+      SHA-256 (for stage_reason/dupe_of_file_id bookkeeping).
     - Files unique to the loser (no SHA match, or sha=NULL)
       → counted in unique_count; NOT staged; move through normal pipeline.
     - Files with status='done' or status='error' → skipped entirely.
@@ -1011,7 +1209,7 @@ def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
     ).fetchall()
 
     if not reviewed:
-        return set(), 0
+        return set(), 0, {}
 
     # Resolve each pair to (keeper_folder, loser_folder) and collect the folder
     # names we care about. A folder may be a keeper in one pair and a loser in
@@ -1035,6 +1233,7 @@ def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
     # prefixes like D:\B vs D:\B2 never collide because the chain only yields
     # whole path components).
     keeper_shas_by_folder: dict[str, set[str]] = defaultdict(set)
+    keeper_file_by_sha_in_folder: dict[str, dict[str, int]] = defaultdict(dict)
     loser_files_by_folder: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
 
     for r in db.conn.execute("SELECT file_id, path, sha256, status FROM files"):
@@ -1046,6 +1245,7 @@ def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
         while cur:
             if cur in keeper_folders and sha is not None:
                 keeper_shas_by_folder[cur].add(sha)
+                keeper_file_by_sha_in_folder[cur].setdefault(sha, fid)
             if cur in loser_folders and status != "done":
                 loser_files_by_folder[cur].append((fid, sha))
             idx = cur.rfind("\\")
@@ -1054,21 +1254,35 @@ def _folder_merge_loser_ids(db: Database) -> tuple[set[int], int]:
             cur = cur[:idx]
 
     loser_ids: set[int] = set()
+    keeper_of: dict[int, int] = {}
     unique_count = 0
     for kf, lf in pairs:
         keeper_shas = keeper_shas_by_folder.get(kf, set())
+        keeper_files = keeper_file_by_sha_in_folder.get(kf, {})
         for fid, sha in loser_files_by_folder.get(lf, []):
             if sha is None or sha not in keeper_shas:
                 unique_count += 1
             else:
                 loser_ids.add(fid)
+                keeper_of[fid] = keeper_files.get(sha)
 
-    return loser_ids, unique_count
+    return loser_ids, unique_count, keeper_of
 
 
 # ---------------------------------------------------------------------------
 # Target path builder
 # ---------------------------------------------------------------------------
+
+def _group_date_range(group: dict | None) -> tuple[date, date] | None:
+    """The (min, max) EXIF/resolved date span of an 'event'-kind group, for
+    _sanitize_event to verify an ambiguous date-RANGE tail against. None for
+    a 'subject' group (no span recorded) or no group (single-day / no
+    resolved folder) — _sanitize_event then falls back conservatively."""
+    if not group or group.get("kind") != "event":
+        return None
+    start = group["start"]
+    return start, start + timedelta(days=group["span"] - 1)
+
 
 def _event_subdir(base: Path, dt: datetime, event: str, group: dict | None,
                   ov_event: str = "") -> Path:
@@ -1163,7 +1377,9 @@ def _build_target_path(
     if row["file_type"] == "VIDEO":
         resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
         group = (event_groups or {}).get(str(resolved)) if resolved else None
-        event = _ov_event or (_sanitize_event(resolved.name) if resolved else "")
+        event = _ov_event or (
+            _sanitize_event(resolved.name, _group_date_range(group)) if resolved else ""
+        )
 
         if dt is None:
             # No date → can't co-locate; keep the standalone NoDate tree.
@@ -1192,8 +1408,10 @@ def _build_target_path(
     # The label comes from the RESOLVED event folder (climbs past camera-dump /
     # date-divider subfolders); falls back to "" (no label) when unresolved.
     resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
-    event = _ov_event or (_sanitize_event(resolved.name) if resolved else "")
     group = (event_groups or {}).get(str(resolved)) if resolved else None
+    event = _ov_event or (
+        _sanitize_event(resolved.name, _group_date_range(group)) if resolved else ""
+    )
 
     if dt is None:
         subdir = target_root / "NoDate"
@@ -1340,11 +1558,17 @@ def plan(db: Database, target_root: Path, force: bool = False,
 
     # ── 1. Identify files to stage-delete ────────────────────────────────────
     stage_ids: set[int] = set()
+    # Why each staged file is staged, and which surviving file it duplicates
+    # (when known): file_id -> (stage_reason, dupe_of_file_id | None). Drives
+    # the staging subfolder split and the operations.stage_reason/dupe_of_file_id
+    # columns so a human reviewing _staging/ doesn't have to reverse-engineer it.
+    reason_map: dict[int, tuple[str, int | None]] = {}
 
     # 1a. All RESIZED_JPEGs
     for batch in db.iter_files(file_type="RESIZED_JPEG"):
         for row in batch:
             stage_ids.add(row["file_id"])
+            reason_map[row["file_id"]] = ("resized_jpeg", None)
 
     # Files staged because their CONTENT is preserved by a larger original (a
     # different sha256), not by a byte-identical twin.  The 1d safety net (which
@@ -1382,6 +1606,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 if fid != keeper:
                     dup_non_keepers.add(fid)
                     stage_ids.add(fid)
+                    reason_map[fid] = ("exact_dupe", keeper)
 
     # 1c. Near-duplicate losers the user marked for deletion in `review`.
     # The reviewer only records the decision (duplicates.status='reviewed' +
@@ -1396,21 +1621,27 @@ def plan(db: Database, target_root: Path, force: bool = False,
         loser = r["file_id_a"] if r["keep_file_id"] == r["file_id_b"] else r["file_id_b"]
         near_dup_losers.add(loser)
         stage_ids.add(loser)
+        reason_map[loser] = ("near_dupe", r["keep_file_id"])
 
     # 1c-bis. Redundant copies — re-encodes and downscales of a shot whose better
     # version survives (different sha256, so EXACT dedup never catches them).
     # keeper = best/largest; the redundant copies' content is preserved by that
     # survivor, so they are content-safe (exempt from the 1d byte-survival net).
     with console.status("Finding redundant copies (re-encodes + resizes)…"):
-        redundant_copy_losers = redundant_copy_ids(db)
+        redundant_keeper_of = _redundant_copy_keeper_map(db)
+    redundant_copy_losers = set(redundant_keeper_of.keys())
     stage_ids.update(redundant_copy_losers)
     content_safe_stage.update(redundant_copy_losers)
+    for fid, keeper in redundant_keeper_of.items():
+        reason_map[fid] = ("redundant_copy", keeper)
 
     # 1d. Folder-merge loser staging — files in reviewed "loser" folders whose
     # SHA-256 is confirmed present in the "keeper" folder subtree.
     with console.status("Staging folder-merge losers…"):
-        folder_merge_losers, fm_unique_count = _folder_merge_loser_ids(db)
+        folder_merge_losers, fm_unique_count, fm_keeper_of = _folder_merge_loser_ids(db)
     stage_ids.update(folder_merge_losers)
+    for fid in folder_merge_losers:
+        reason_map[fid] = ("folder_merge_loser", fm_keeper_of.get(fid))
     # NOT added to content_safe_stage: keeper has the same SHA, so the 1e
     # safety net correctly protects the keeper copy without exemption.
 
@@ -1438,6 +1669,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
             near_dup_losers.discard(keeper)
             dup_non_keepers.discard(keeper)
             folder_merge_losers.discard(keeper)
+            reason_map.pop(keeper, None)
             rescued += 1
     if rescued:
         db.log(
@@ -1488,8 +1720,10 @@ def plan(db: Database, target_root: Path, force: bool = False,
                 continue
 
             if fid in stage_ids:
+                reason, dupe_of = reason_map.get(fid, (None, None))
+                subfolder = _STAGE_SUBFOLDER.get(reason, "other")
                 # Include file_id in staging name to avoid collisions
-                target = staging_root / f"{fid}_{row['filename']}"
+                target = staging_root / subfolder / f"{fid}_{row['filename']}"
                 ops.append({
                     "file_id": fid,
                     "op_type": "STAGE_DELETE",
@@ -1497,6 +1731,8 @@ def plan(db: Database, target_root: Path, force: bool = False,
                     "target_path": str(target),
                     "status": "planned",
                     "planned_at": now,
+                    "stage_reason": reason,
+                    "dupe_of_file_id": dupe_of,
                 })
             else:
                 if row["file_type"] == "UNKNOWN":
@@ -1516,14 +1752,18 @@ def plan(db: Database, target_root: Path, force: bool = False,
                     "target_path": str(target),
                     "status": "planned",
                     "planned_at": now,
+                    "stage_reason": None,
+                    "dupe_of_file_id": None,
                 })
 
     with console.status(f"Writing {len(ops):,} operations to database…"):
         db.conn.executemany(
             """
             INSERT OR IGNORE INTO operations
-                (file_id, op_type, source_path, target_path, status, planned_at)
-            VALUES (:file_id, :op_type, :source_path, :target_path, :status, :planned_at)
+                (file_id, op_type, source_path, target_path, status, planned_at,
+                 stage_reason, dupe_of_file_id)
+            VALUES (:file_id, :op_type, :source_path, :target_path, :status, :planned_at,
+                    :stage_reason, :dupe_of_file_id)
             """,
             ops,
         )

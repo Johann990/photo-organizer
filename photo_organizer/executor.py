@@ -168,7 +168,7 @@ def execute(
 
     ops = db.conn.execute(
         f"""
-        SELECT o.op_id, o.file_id, o.op_type, o.source_path, o.target_path
+        SELECT o.op_id, o.file_id, o.op_type, o.source_path, o.target_path, o.status
         FROM   operations o JOIN files f USING(file_id)
         WHERE  {" AND ".join(where)}
         ORDER  BY o.op_type   -- MOVE before STAGE_DELETE (alphabetical)
@@ -438,30 +438,83 @@ def execute(
 # Undo — reverse completed operations back to their original locations
 # ---------------------------------------------------------------------------
 
-def undo(db: Database, force: bool = False) -> None:
+def undo(
+    db: Database,
+    force: bool = False,
+    *,
+    year: str | None = None,
+    camera: str | None = None,
+    software: str | None = None,
+    file_type: str | None = None,
+    op_type: str | None = None,
+) -> None:
     """
-    Revert every completed ('done') operation: move each file from its current
+    Revert completed ('done') operations: move each file from its current
     location back to the original source_path recorded at plan time.
+
+    Optional filters select a SUBSET to revert now (the rest stay 'done' for
+    a later run, so you can undo in batches — mirrors execute()'s filters):
+      year      — EXIF year, e.g. "2023"
+      camera    — substring match on camera_model, e.g. "ILCE-7RM2"
+      software  — substring match on software, e.g. "Lightroom"
+      file_type — exact file_type, e.g. "RAW" / "CAMERA_JPEG" / "DEV_JPEG" / "VIDEO"
+      op_type   — exact op_type, e.g. "STAGE_DELETE" (undo only staged-for-deletion
+                  files) or "MOVE" (undo only organised moves)
 
     Uses files.path as the current location (so files renamed _conflict_N on
     execute are still found) and operations.source_path as the original target.
     Never overwrites: if an original path is already occupied, that file is
-    left in place and logged. After a successful undo the 'execute' phase is
-    reset to 'pending' so the plan can be re-run.
+    left in place and logged. After an undo that leaves NO 'done' operations
+    remaining, the 'execute' phase is reset to 'pending' so the plan can be
+    re-run; a filtered/partial undo leaves it alone so a later execute won't
+    redo work that's still in place.
     """
     print_phase_header("undo", "Revert Moved Files")
 
+    filtered = any([year, camera, software, file_type, op_type])
+
+    where = ["o.status = 'done'"]
+    params: list = []
+    if year:
+        where.append("substr(f.datetime_original, 1, 4) = ?")
+        params.append(str(year))
+    if camera:
+        where.append("LOWER(f.camera_model) LIKE '%' || LOWER(?) || '%'")
+        params.append(camera)
+    if software:
+        where.append("LOWER(f.software) LIKE '%' || LOWER(?) || '%'")
+        params.append(software)
+    if file_type:
+        where.append("f.file_type = ?")
+        params.append(file_type.upper())
+    if op_type:
+        where.append("o.op_type = ?")
+        params.append(op_type.upper())
+
     rows = db.conn.execute(
-        """
+        f"""
         SELECT o.op_id, o.file_id, o.source_path, f.path AS current_path
         FROM   operations o JOIN files f USING(file_id)
-        WHERE  o.status = 'done'
+        WHERE  {" AND ".join(where)}
         ORDER  BY o.executed_at DESC, o.op_id DESC
-        """
+        """,
+        params,
     ).fetchall()
 
+    if filtered:
+        active = ", ".join(
+            f"{k}={v}" for k, v in
+            (("year", year), ("camera", camera), ("software", software),
+             ("type", file_type), ("op-type", op_type))
+            if v
+        )
+        console.print(f"  [cyan]Filtered run:[/cyan] {active}")
+
     if not rows:
-        print_warning("Nothing to undo — no completed operations found.")
+        if filtered:
+            print_warning("No completed operations match this filter.")
+        else:
+            print_warning("Nothing to undo — no completed operations found.")
         return
 
     total = len(rows)
@@ -539,9 +592,14 @@ def undo(db: Database, force: bool = False) -> None:
 
     db.commit()
 
-    # Allow the plan to be executed again from a clean slate.
+    # Allow the plan to be executed again from a clean slate — only once
+    # NOTHING is left 'done' (a filtered/partial undo leaves the rest in place).
     if reverted and errors == 0 and skipped == 0:
-        db.set_phase_status("execute", "pending")
+        remaining_done: int = db.conn.execute(
+            "SELECT COUNT(*) FROM operations WHERE status = 'done'"
+        ).fetchone()[0]
+        if remaining_done == 0:
+            db.set_phase_status("execute", "pending")
 
     t = Table(title="Undo Summary", box=box.SIMPLE_HEAVY, show_header=True)
     t.add_column("Category", style="cyan")

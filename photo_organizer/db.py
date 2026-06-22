@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS folder_overrides (
     date_override TEXT,               -- override date 'YYYY-MM-DD' (NULL = no override)
     note          TEXT,
     updated_at    TEXT,
-    per_day_split INTEGER NOT NULL DEFAULT 0
+    per_day_split    INTEGER NOT NULL DEFAULT 0,
+    confirmed_subject INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -125,7 +126,12 @@ CREATE TABLE IF NOT EXISTS operations (
                  CHECK(status IN ('planned','confirmed','in_progress','done','error','skipped')),
     error_msg    TEXT,
     planned_at   TEXT,
-    executed_at  TEXT
+    executed_at  TEXT,
+    -- why a STAGE_DELETE op exists: resized_jpeg / exact_dupe / near_dupe /
+    -- redundant_copy / folder_merge_loser (NULL for MOVE/RENAME/DELETE ops)
+    stage_reason     TEXT,
+    -- the surviving file this op's file is redundant with (NULL when N/A)
+    dupe_of_file_id  INTEGER REFERENCES files(file_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ops_status ON operations(status);
@@ -197,7 +203,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Bump whenever the on-disk schema changes in a way a fresh `connect()` (running
 # SCHEMA_SQL + _apply_migrations) brings an old DB up to. The stored marker is a
 # guard, not the migration mechanism: migrations stay idempotent ALTERs.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 class SchemaVersionError(RuntimeError):
@@ -244,6 +250,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _migrate_filetype_check(conn)
     _migrate_operations_check(conn)
     _migrate_folder_overrides_per_day_split(conn)
+    _migrate_folder_overrides_confirmed_subject(conn)
+    _migrate_operations_stage_reason(conn)
 
 
 def _migrate_operations_check(conn: sqlite3.Connection) -> None:
@@ -297,7 +305,29 @@ def _migrate_folder_overrides_per_day_split(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE folder_overrides ADD COLUMN per_day_split INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _migrate_folder_overrides_confirmed_subject(conn: sqlite3.Connection) -> None:
+    """Add folder_overrides.confirmed_subject to an existing DB. Idempotent: only
+    ALTERs when the column is absent (a fresh DB already has it via SCHEMA_SQL)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(folder_overrides)").fetchall()]
+    if "confirmed_subject" not in cols:
+        conn.execute(
+            "ALTER TABLE folder_overrides ADD COLUMN confirmed_subject "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
         conn.commit()
+
+
+def _migrate_operations_stage_reason(conn: sqlite3.Connection) -> None:
+    """Add operations.stage_reason / dupe_of_file_id to an existing DB. Idempotent:
+    only ALTERs when the columns are absent (a fresh DB already has them via SCHEMA_SQL)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(operations)").fetchall()]
+    if "stage_reason" not in cols:
+        conn.execute("ALTER TABLE operations ADD COLUMN stage_reason TEXT")
+    if "dupe_of_file_id" not in cols:
+        conn.execute("ALTER TABLE operations ADD COLUMN dupe_of_file_id INTEGER REFERENCES files(file_id)")
+    conn.commit()
 
 
 def _migrate_filetype_check(conn: sqlite3.Connection) -> None:
@@ -773,19 +803,26 @@ class Database:
 
     def set_folder_override(self, source_folder: str, *, event_name=None,
                             date_override=None, note=None, per_day_split=0,
-                            updated_at: str) -> None:
+                            confirmed_subject=0, updated_at: str) -> None:
         """Upsert a per-folder override. event_name/date_override = None clears
-        that column; per_day_split (0/1) flags an event for per-day {mmdd}/ split.
+        that column; per_day_split (0/1) flags an event for per-day {mmdd}/ split;
+        confirmed_subject (0/1) records that a >MAX_EVENT_SPAN_DAYS named folder
+        was reviewed and really is one recurring subject (see
+        detect_subjects_needing_confirmation) — informational only, `plan`'s
+        subject classification is unchanged either way.
         Stores the full row keyed by source_folder."""
         self.conn.execute(
             "INSERT INTO folder_overrides "
-            "(source_folder, event_name, date_override, note, per_day_split, updated_at) "
-            "VALUES (?,?,?,?,?,?) "
+            "(source_folder, event_name, date_override, note, per_day_split, "
+            "confirmed_subject, updated_at) "
+            "VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(source_folder) DO UPDATE SET "
             "event_name=excluded.event_name, date_override=excluded.date_override, "
             "note=excluded.note, per_day_split=excluded.per_day_split, "
+            "confirmed_subject=excluded.confirmed_subject, "
             "updated_at=excluded.updated_at",
-            (source_folder, event_name, date_override, note, int(per_day_split), updated_at),
+            (source_folder, event_name, date_override, note, int(per_day_split),
+             int(confirmed_subject), updated_at),
         )
 
     def clear_folder_override(self, source_folder: str) -> None:

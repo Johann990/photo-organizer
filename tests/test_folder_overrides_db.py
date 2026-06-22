@@ -126,8 +126,8 @@ def test_set_per_day_split(tmp_path):
         assert row["per_day_split"] == 1
 
 
-def test_schema_version_is_6():
-    assert SCHEMA_VERSION == 6
+def test_schema_version_is_8():
+    assert SCHEMA_VERSION == 8
 
 
 def test_migration_adds_per_day_split_to_v5_db(tmp_path):
@@ -151,3 +151,47 @@ def test_migration_adds_per_day_split_to_v5_db(tmp_path):
         cols = [r[1] for r in db.conn.execute("PRAGMA table_info(folder_overrides)")]
         assert "per_day_split" in cols
         assert db.get_folder_overrides()["D:\\Old"]["per_day_split"] == 0
+
+
+def test_confirmed_subject_defaults_zero(tmp_path):
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        db.set_folder_override("D:\\Subjects\\Baby", event_name="Baby", updated_at=_now())
+        db.commit()
+        row = db.get_folder_overrides()["D:\\Subjects\\Baby"]
+        assert row["confirmed_subject"] == 0
+
+
+def test_set_confirmed_subject(tmp_path):
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    with Database(db_path) as db:
+        db.set_folder_override(
+            "D:\\Subjects\\Baby", event_name="Baby", confirmed_subject=1, updated_at=_now()
+        )
+        db.commit()
+        row = db.get_folder_overrides()["D:\\Subjects\\Baby"]
+        assert row["confirmed_subject"] == 1
+
+
+def test_migration_adds_confirmed_subject_to_v6_db(tmp_path):
+    import sqlite3
+    db_path = tmp_path / ".photo_organizer" / "library.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE folder_overrides (source_folder TEXT PRIMARY KEY, "
+        "event_name TEXT, date_override TEXT, note TEXT, updated_at TEXT, "
+        "per_day_split INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '6')")
+    conn.execute(
+        "INSERT INTO folder_overrides (source_folder, event_name) VALUES (?, ?)",
+        ("D:\\Old", "OldEvent"),
+    )
+    conn.commit()
+    conn.close()
+    with Database(db_path) as db:
+        cols = [r[1] for r in db.conn.execute("PRAGMA table_info(folder_overrides)")]
+        assert "confirmed_subject" in cols
+        assert db.get_folder_overrides()["D:\\Old"]["confirmed_subject"] == 0

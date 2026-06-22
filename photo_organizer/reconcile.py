@@ -47,6 +47,7 @@ _CONFLICT_RE = re.compile(r"_conflict_\d+$")
 MOVED = "moved"
 STAGED = "staged"
 CONFLICT = "conflict-renamed"
+DELETED = "deleted (acknowledged)"
 SKIPPED = "skipped/pending"
 ERROR = "error"
 UNTOUCHED = "untouched-by-design"
@@ -60,7 +61,11 @@ def _classify(file_row, ops: list) -> str:
     Assign a single terminal state to one `files` row given its operations.
 
     Order matters — error wins over everything so failures are never hidden
-    behind a (stale) done/pending classification.
+    behind a (stale) done/pending classification. DELETED is checked next,
+    ahead of MOVE/STAGE_DELETE: a file organized by `execute` and LATER
+    removed via `sync.acknowledge_deleted` (sync.py, Pillar 2) carries both
+    a done MOVE/STAGE_DELETE op (its original organize) and a done DELETE op
+    (the later acknowledgment) — DELETED reflects its current, final state.
     """
     file_status = file_row["status"]
     op_statuses = {o["status"] for o in ops}
@@ -68,6 +73,9 @@ def _classify(file_row, ops: list) -> str:
     # error: surfaced first so nothing masks it.
     if file_status == "error" or "error" in op_statuses:
         return ERROR
+
+    if any(o["op_type"] == "DELETE" and o["status"] == "done" for o in ops):
+        return DELETED
 
     done_move = any(o["op_type"] == "MOVE" and o["status"] == "done" for o in ops)
     done_stage = any(
@@ -123,7 +131,7 @@ def reconcile(db: Database, verify_disk: bool = False) -> bool:
         ops_by_file.setdefault(op["file_id"], []).append(op)
 
     counts: dict[str, int] = {
-        MOVED: 0, STAGED: 0, CONFLICT: 0, SKIPPED: 0,
+        MOVED: 0, STAGED: 0, CONFLICT: 0, DELETED: 0, SKIPPED: 0,
         ERROR: 0, UNTOUCHED: 0, UNACCOUNTED: 0,
     }
     unaccounted: list[tuple[int, str]] = []
@@ -151,6 +159,11 @@ def reconcile(db: Database, verify_disk: bool = False) -> bool:
         t.add_row(
             "[yellow]Conflict-renamed (_conflict_N)[/yellow]",
             f"{counts[CONFLICT]:,}", "moved, name collision",
+        )
+    if counts[DELETED]:
+        t.add_row(
+            "Deleted (acknowledged)",
+            f"{counts[DELETED]:,}", "removed post-organize via `sync delete`",
         )
     if counts[SKIPPED]:
         t.add_row(

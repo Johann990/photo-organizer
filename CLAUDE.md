@@ -130,6 +130,10 @@ python -m photo_organizer execute --db C:\photos.db
 - **near-dupe review 與 plan 的關係 / review × plan**：`review` 只把決策寫進 `duplicates` 表（`status='reviewed'` + `keep_file_id`），**不直接建搬移操作**。實際的 `STAGE_DELETE` 由 `plan` 讀取這些決策後建立 → 因此**請在 `plan` 之前跑 `review`**（或事後重跑 `plan`）。如此 `plan --force` 重建計畫時也不會清掉人工審查結果，敗者也不會同時被建 MOVE。
   / `review` records decisions only; `plan` creates the STAGE_DELETE for each loser. Run `review` before `plan` (or re-run `plan`). `plan --force` no longer wipes review decisions.
 
+- **每筆 STAGE_DELETE 都記錄理由與「跟誰重複」/ every STAGE_DELETE carries a reason and its specific duplicate**：`operations` 表有 `stage_reason`（`resized_jpeg | exact_dupe | near_dupe | redundant_copy | folder_merge_loser`）與 `dupe_of_file_id`（該檔是哪個**留存** file_id 的重複——`resized_jpeg` 沒有特定對象，為 `NULL`）。`_staging/to_delete/` 底下不再是單一平鋪資料夾，而是依 `stage_reason` 分子資料夾（`resized_jpeg/` `exact_dupe/` `near_dupe/` `redundant_copy/` `folder_merge/`），避免一個資料夾塞進過多檔案（曾在大型庫造成檔案總管/掃描變慢等問題）。檔名前綴 `{file_id}_` 避免子資料夾內同名碰撞。查某檔案被誰取代：
+  `SELECT stage_reason, dupe_of_file_id FROM operations WHERE file_id = ?;`
+  / every STAGE_DELETE op records WHY (`stage_reason`) and WHICH surviving file it duplicates (`dupe_of_file_id`, NULL for `resized_jpeg` which has no single counterpart). Staged files land under `_staging/to_delete/<reason>/` instead of one flat pile (too many files in one folder caused Explorer/scan slowdowns); filenames are prefixed with `{file_id}_` to avoid collisions within a subfolder.
+
 - **重複副本自動清除 / Redundant-copy auto-staging**（`planner.redundant_copy_ids`）：同一張照片常有多個版本——重新存過的 JPEG（**位元組不同** EXACT SHA-256 抓不到）、分享匯出、縮圖（**改了檔名**或縮太多 **pHash 漂走** near 也配不上）→ 漏網污染 review。`plan` 用 **union-find** 把「同一張」的所有副本連成一個連通分量，每個分量**只留 keep_score 最佳版**、其餘全標 `STAGE_DELETE`（預覽列「Redundant copies (re-encodes + resizes)」）。兩種「同一張」連結各自安全：
   - **連結 1 — 同檔名 + 同時間 + 同長寬比**：同（檔名 stem + EXIF `datetime_original`）且長寬比相符（容差 `_RESIZE_ASPECT_TOL`）→ 同一張相機影格被重存／縮放（**任何尺寸**,連 pHash 漂走的小縮圖也算）。長寬比不同（**裁切**或旋轉）**不連** → 保留。
   - **連結 2 — 同時間 + 同 pHash（非垃圾）**：認出**改名的副本**（如 `image00017.jpg`）。但**只連「非相機原始檔名」的匯出副本**到該張的最佳相機原檔；**兩個不同的相機原始檔名**（`IMG_9606` vs `IMG_9607`，`_is_camera_original_name`）是相機各自配號的**不同影格**，即使 pHash 完全相同（Hamming 0）也**不連** → 連拍兩格都保留、留進 near review。（相機每按一次快門配一個流水號,故不同號=不同張;同號的副本走連結 1 的同 stem。）
@@ -199,6 +203,8 @@ python -m photo_organizer review --organize --db C:\photos.db
   / detects already-day-organized multi-day events and offers a per_day_split toggle (keyed by the event root).
 - **手動拆夾提醒(唯讀)/ Manual-split reminder (read-only)**:列出**多日且日期分散**(至少一個相鄰日 gap > 3 天,可能混了不同活動)的平鋪資料夾,建議去**檔案總管**手動拆夾 → `relocate` → `plan`。連續行程(所有 gap ≤ 3 天)視為單一活動,平鋪即可,**不列入**。
   / read-only list of SCATTERED multi-day folders (a >3-day gap → likely mixed occasions); split manually in Explorer then `relocate`. Contiguous trips are filed fine flat and are NOT flagged.
+- **Subject 收藏確認 / Subject-confirmation**:`planner._compute_event_groups` 對任何**有名字**、確信日期跨度 **> 30 天**的資料夾,一律自動歸類成「Subject 收藏」(依年份分夾,不拆成多個活動)——但這只看跨度,分不出「真的是長期主題(孩子、寵物、常去的地點)」還是「剛好兩件不相干的事被丟進同一個資料夾、湊巧超過 30 天」(例如平時練習照混了一次 2 天出遊,頭尾跨度仍 > 30 天)。`detect_subjects_needing_confirmation` 把**尚未確認**的候選(`folder_overrides.confirmed_subject != 1`)列出來,按鈕勾選後寫 `confirmed_subject=1`,確認過的以後不再提醒。**這一步純粹是提醒 + 記錄,不改變 `plan` 的分類行為**——不管有沒有確認,`plan` 一律照舊規則把 >30 天的命名資料夾當 Subject;真要拆成多個活動,還是走「手動拆資料夾 → `relocate` → `plan --force`」。
+  / any NAMED folder whose confident-date span exceeds 30 days is auto-classified as a "Subject" (organized by year, never split) — but the heuristic only looks at span, so two unrelated short occasions dumped in one folder can accidentally clear the bar too. `detect_subjects_needing_confirmation` surfaces unconfirmed long-span folders in `review --organize`; confirming just records intent (`confirmed_subject=1`) and stops the reminder — it does NOT change `plan`'s classification. To actually split a mixed folder, still use manual Explorer split → `relocate` → `plan --force`.
 
 ### 異地備份 / Clone — verified incremental backup to another volume（`clone`）
 
@@ -310,10 +316,18 @@ python -m photo_organizer execute --db C:\photos.db --type DEV_JPEG
 
 ```bat
 python -m photo_organizer undo --db C:\photos.db
+python -m photo_organizer undo --db C:\photos.db --year 2023
+python -m photo_organizer undo --db C:\photos.db --camera ILCE-7RM2
+python -m photo_organizer undo --db C:\photos.db --software Lightroom
+python -m photo_organizer undo --db C:\photos.db --type DEV_JPEG
+python -m photo_organizer undo --db C:\photos.db --op-type STAGE_DELETE   # 只復原「待刪除」的暫存,不動已整理的 MOVE
 ```
 - 依 `operations`（`source_path`）+ `files.path`（現位置,含 `_conflict_N`）逆向 `os.rename` 還原
+- **可過濾,可分批**：`--year` / `--camera` / `--software` / `--type` / `--op-type` 沿用 `execute` 的過濾語法,可單獨或組合;只還原符合的,其餘維持 `done`,之後再跑 `undo` 接續。`--op-type STAGE_DELETE` 等於「只把誤判要刪的檔案救回」、`--op-type MOVE` 則只復原整理動作不動暫存刪除。
+  / filters mirror `execute`'s; a filtered run reverts only the matching subset and leaves the rest `done` for a later run. `--op-type STAGE_DELETE` rescues only mis-staged-for-deletion files; `--op-type MOVE` reverts only the organising moves.
 - **絕不覆蓋**:原位置若已被占用則跳過並寫 `run_log`(`phase='undo'`)
-- 還原成功後 `execute` 階段重置為 `pending`,可重新 plan/execute
+- 還原成功後 `execute` 階段重置為 `pending`,可重新 plan/execute——但**只在整庫已無 `done` 操作殘留時**才重置(有過濾、還沒還原完的情況下維持原狀,避免之後的 `execute` 重做已經復原好的東西)。
+  / `execute` phase resets to `pending` only once NOTHING is left `done` across the whole DB — a filtered/partial undo leaves the phase status alone so a later `execute` doesn't redo work that's still in place.
 
 ## 注意
 

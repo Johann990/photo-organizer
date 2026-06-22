@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .db import Database, SchemaVersionError, default_db_path
-from .progress import console, print_error
+from .progress import console, print_error, print_success, print_warning
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -318,6 +318,82 @@ def cmd_reconcile(args):
     sys.exit(0 if ok else 1)
 
 
+def cmd_audit(args):
+    cfg = _load_cfg(args)
+    from .auditor import audit
+    with Database(_db_path(args, cfg)) as db:
+        report = audit(db)
+    sys.exit(0 if report.exit_ok else 1)
+
+
+def cmd_sync(args):
+    cfg = _load_cfg(args)
+    from .sync import acknowledge_deleted, relocate_path
+    action = args.sync_action
+    with Database(_db_path(args, cfg)) as db:
+        if action in ("rename", "move"):
+            result = relocate_path(db, args.old, args.new)
+            if result["refused"] == "old_path_still_exists":
+                print_error(
+                    f"Refused — old path still exists on disk: {args.old}\n"
+                    "  (the rename/move hasn't actually happened — do it in "
+                    "Explorer first, then re-run sync)"
+                )
+                sys.exit(1)
+            if result["refused"] == "new_path_missing":
+                print_error(f"Refused — new path not found on disk: {args.new}")
+                sys.exit(1)
+            if result["matched"] == 0:
+                print_warning(f"No DB rows found under: {args.old}")
+                sys.exit(1)
+            console.print(
+                f"  sync {action}: {result['relocated']:,} file(s) re-pointed "
+                f"(matched {result['matched']:,}"
+                + (f", {result['skipped_not_done']} not yet organized — left alone"
+                   if result["skipped_not_done"] else "")
+                + (f", {result['skipped_no_disk_match']} no disk match — left alone"
+                   if result["skipped_no_disk_match"] else "")
+                + ")."
+            )
+            console.print(
+                "  [dim]To revert: python -m photo_organizer undo --op-type RENAME[/dim]"
+            )
+            sys.exit(0 if result["relocated"] > 0 else 1)
+        else:  # delete
+            yes = getattr(args, "yes", False)
+            if not yes:
+                if not sys.stdin.isatty():
+                    print_warning(
+                        "Non-interactive shell — pass --yes to confirm. Nothing changed."
+                    )
+                    sys.exit(1)
+                try:
+                    ans = input(
+                        f"Acknowledge '{args.path}' as permanently deleted "
+                        "(cannot be undone)? [y/N] "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+                yes = ans == "y"
+                if not yes:
+                    console.print("[yellow]Cancelled — nothing changed.[/yellow]")
+                    sys.exit(1)
+            result = acknowledge_deleted(db, args.path, yes=yes)
+            if result["matched"] == 0:
+                print_warning(f"No DB rows found under: {args.path}")
+                sys.exit(1)
+            if result["skipped_still_on_disk"]:
+                print_warning(
+                    f"{result['skipped_still_on_disk']:,} file(s) still exist on disk — "
+                    "not acknowledged (did you mean `sync move`/`sync rename`?)."
+                )
+            print_success(
+                f"Acknowledged {result['acknowledged']:,} file(s) as deleted. "
+                "This cannot be undone — the bytes are gone."
+            )
+            sys.exit(0 if result["acknowledged"] > 0 else 1)
+
+
 def cmd_relocate(args):
     cfg = _load_cfg(args)
     from .relocate import relocate
@@ -373,7 +449,15 @@ def cmd_undo(args):
     cfg = _load_cfg(args)
     from .executor import undo
     with Database(_db_path(args, cfg)) as db:
-        undo(db, force=getattr(args, "force", False))
+        undo(
+            db,
+            force=getattr(args, "force", False),
+            year=getattr(args, "year", None),
+            camera=getattr(args, "camera", None),
+            software=getattr(args, "software", None),
+            file_type=getattr(args, "type", None),
+            op_type=getattr(args, "op_type", None),
+        )
 
 
 def cmd_review(args):
@@ -388,7 +472,8 @@ def cmd_review(args):
         elif getattr(args, "organize", False):
             from .folderorganize import serve as organize_serve
             scan_roots = cfg.input_dirs if (cfg and cfg.input_dirs) else None
-            organize_serve(db, port=getattr(args, "port", 0), scan_roots=scan_roots)
+            organize_serve(db, port=getattr(args, "port", 0), scan_roots=scan_roots,
+                           year=getattr(args, "year", None))
         elif getattr(args, "web", False):
             from .webreview import serve
             serve(db, review_all=getattr(args, "all", False),
@@ -624,6 +709,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_recon.set_defaults(func=cmd_reconcile)
 
+    # audit — read-only DB consistency audit (decision-ledger health check,
+    # distinct from validate's pre-flight env check and reconcile's
+    # conservation proof). Never touches disk.
+    p_audit = sub.add_parser(
+        "audit", parents=[shared],
+        help="DB consistency audit: orphan refs, dangling dupes, unresolved "
+             "reviews, path collisions, event-name residue, empty twins, "
+             "low-confidence dates (read-only, DB-only)",
+    )
+    p_audit.set_defaults(func=cmd_audit)
+
+    # sync — fast, EXPLICIT DB resync for manual Explorer edits to already-
+    # organized ('done') files (Pillar 2). Unlike `relocate` (which scans the
+    # whole files table to discover what moved), the user states the old/new
+    # path directly — no library-wide scan. rename/move write a 'RENAME' op
+    # so the EXISTING `undo --op-type RENAME` reverses it for free; delete is
+    # a one-way acknowledgment (nothing to undo — the bytes are gone).
+    p_sync = sub.add_parser(
+        "sync",
+        help="Fast DB resync for a manual Explorer edit to an already-organized "
+             "file/folder: rename, move, or acknowledge a delete (no rescan)",
+    )
+    sync_sub = p_sync.add_subparsers(dest="sync_action", required=True)
+
+    p_sync_rename = sync_sub.add_parser(
+        "rename", parents=[shared],
+        help="Re-point every file under a renamed event folder",
+    )
+    p_sync_rename.add_argument("old", help="Old folder path (must no longer exist on disk)")
+    p_sync_rename.add_argument("new", help="New folder path (must exist on disk)")
+    p_sync_rename.set_defaults(func=cmd_sync, sync_action="rename")
+
+    p_sync_move = sync_sub.add_parser(
+        "move", parents=[shared],
+        help="Re-point a single manually-moved file",
+    )
+    p_sync_move.add_argument("old", help="Old file path (must no longer exist on disk)")
+    p_sync_move.add_argument("new", help="New file path (must exist on disk)")
+    p_sync_move.set_defaults(func=cmd_sync, sync_action="move")
+
+    p_sync_delete = sync_sub.add_parser(
+        "delete", parents=[shared],
+        help="Acknowledge a file/folder manually deleted outside the staging workflow",
+    )
+    p_sync_delete.add_argument("path", help="Path that no longer exists on disk")
+    p_sync_delete.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt"
+    )
+    p_sync_delete.set_defaults(func=cmd_sync, sync_action="delete")
+
     # relocate — re-point files.path for manually-moved files via sha256
     p_reloc = sub.add_parser(
         "relocate", parents=[shared],
@@ -673,7 +808,19 @@ def build_parser() -> argparse.ArgumentParser:
     # undo
     p_undo = sub.add_parser(
         "undo", parents=[shared],
-        help="Revert all completed moves back to their original locations",
+        help="Revert completed moves back to their original locations "
+             "(optionally a filtered subset)",
+    )
+    p_undo.add_argument("--year", help="Only revert files from this EXIF year, e.g. 2023")
+    p_undo.add_argument("--camera", help="Only revert files whose camera model contains this text")
+    p_undo.add_argument("--software", help="Only revert files whose software contains this text (e.g. Lightroom)")
+    p_undo.add_argument(
+        "--type", metavar="FILE_TYPE",
+        help="Only revert this file_type (RAW / CAMERA_JPEG / DEV_JPEG / RESIZED_JPEG / VIDEO)",
+    )
+    p_undo.add_argument(
+        "--op-type", metavar="OP_TYPE", dest="op_type",
+        help="Only revert this op_type, e.g. STAGE_DELETE (undo staging) or MOVE (undo organising)",
     )
     p_undo.set_defaults(func=cmd_undo)
 
@@ -747,6 +894,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--organize", action="store_true",
         help="Assign event names / dates to no-event or low-confidence-date folders "
              "(writes folder_overrides consulted by plan)",
+    )
+    p_review.add_argument(
+        "--year", metavar="YYYY",
+        help="With --organize: scope candidates to one year at a time "
+             "(batch P3 triage instead of facing the whole library at once)",
     )
     p_review.set_defaults(func=cmd_review)
 

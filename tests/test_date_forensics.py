@@ -89,6 +89,13 @@ def test_parse_filename_dt_negative(filename):
 TODAY = date(2024, 1, 1)
 
 
+def _local_mtime(s: str) -> datetime:
+    """Expected value of _parse_mtime(s): UTC ISO string converted to the
+    local calendar day/time, tz dropped — mirrors the production conversion
+    so these tests don't hardcode a value that only matches on a UTC+0 box."""
+    return datetime.fromisoformat(s).astimezone().replace(tzinfo=None)
+
+
 def _row(**kw):
     base = {
         "datetime_original": None,
@@ -160,7 +167,21 @@ def test_resolve_digitized_fallback_is_medium():
 def test_resolve_mtime_last_resort_is_low():
     row = _row(mtime="2021-08-20T10:30:00+00:00")
     dt, source, conf = _resolve_date(row, today=TODAY)
-    assert dt == datetime(2021, 8, 20, 10, 30, 0)
+    assert dt == _local_mtime("2021-08-20T10:30:00+00:00")
+    assert source == "mtime"
+    assert conf == "LOW"
+
+
+def test_resolve_mtime_converts_utc_to_local_calendar_day():
+    # Regression for an off-by-one-day bug: the stored mtime is UTC-aware
+    # (scanner.py), but the old _parse_mtime relabelled it naive WITHOUT
+    # converting first, so any file modified between local midnight and the
+    # local UTC offset (e.g. 00:00-08:00 in UTC+8) resolved to the day BEFORE
+    # what Explorer / the OS show for that same file.
+    mtime_str = "2020-01-06T16:22:25+00:00"  # 2020-01-07 00:22 local in UTC+8
+    row = _row(mtime=mtime_str)
+    dt, source, conf = _resolve_date(row, today=TODAY)
+    assert dt == _local_mtime(mtime_str)
     assert source == "mtime"
     assert conf == "LOW"
 
@@ -184,7 +205,7 @@ def test_resolve_future_exif_is_not_trusted():
     dt, source, conf = _resolve_date(row, today=TODAY)
     assert source == "mtime"
     assert conf == "LOW"
-    assert dt == datetime(2023, 12, 31, 10, 0, 0)
+    assert dt == _local_mtime("2023-12-31T10:00:00+00:00")
 
 
 def test_resolve_absurdly_old_exif_discarded():
@@ -194,7 +215,7 @@ def test_resolve_absurdly_old_exif_discarded():
     )
     dt, source, conf = _resolve_date(row, today=TODAY)
     assert source == "mtime"
-    assert dt == datetime(2020, 1, 2, 0, 0, 0)
+    assert dt == _local_mtime("2020-01-02T00:00:00+00:00")
 
 
 @pytest.mark.parametrize("sentinel", ["1980:01:01 00:00:00", "2000:01:01 00:00:00"])
@@ -216,7 +237,7 @@ def test_effective_date_shim_matches_resolver():
 
     row2 = _row(mtime="2021-08-20T10:30:00+00:00")
     dt2, used_mtime2 = _effective_date(row2)
-    assert dt2 == datetime(2021, 8, 20, 10, 30, 0)
+    assert dt2 == _local_mtime("2021-08-20T10:30:00+00:00")
     assert used_mtime2 is True
 
 
