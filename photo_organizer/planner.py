@@ -475,6 +475,7 @@ _CONTAINER_NAMES: frozenset[str] = frozenset({
     "raw_files", "rawtank", "raw_old", "albums", "album", "photos", "照片",
     "jpg", "jpeg", "jpegtank", "depository_aged", "完整備份相簿",
     "slides", "pic", "pics", "samples", "icqreceived_old", "thmbnl", "thmbnls",
+    "video", "videos",                     # the planner's own per-event subfolder
     "待整理",                              # "to be organised" — a TODO bucket
     "m4root",                              # Sony Memory Stick standard root dir
     # RAW-processing / derivative-export output dirs (the real event is ABOVE
@@ -524,7 +525,8 @@ def _norm_path(p: Path | str) -> str:
 
 
 def _resolve_event_folder(
-    path: Path, scan_roots: list[Path] | None = None
+    path: Path, scan_roots: list[Path] | None = None,
+    target_root: Path | None = None,
 ) -> Path | None:
     """Climb from a file's parent folder up to the nearest ancestor that carries
     a real event/subject label, returning that folder (or None if none exists).
@@ -544,11 +546,28 @@ def _resolve_event_folder(
     the only names up to the root are containers/dumps the file has no event →
     None (a no-event date folder), instead of mislabelling a top-level storage
     folder above the root as a subject. Default (None) = unbounded.
+
+    ``target_root`` guards the OTHER direction: a file whose CURRENT path
+    already sits inside the organizer's own output tree — e.g. re-discovered by
+    `relocate` before being re-planned — must never have its structural base
+    folder (Masters/Others/NoDate) mistaken for an event/subject label, which
+    would otherwise nest the real base inside itself (Masters/Masters/2020/).
+    `target_root` itself and `target_root/Masters|Others|NoDate` are therefore
+    hard stops, exactly like a scan root. Default (None) skips this check.
     """
     roots = {_norm_path(r) for r in (scan_roots or [])}
+    boundaries: set[str] = set()
+    if target_root is not None:
+        boundaries = {_norm_path(target_root / sub) for sub in ("Masters", "Others", "NoDate")}
+        boundaries.add(_norm_path(target_root))
     for folder in path.parents:
         name = folder.name
         if not name:                              # reached a drive root
+            return None
+        if boundaries and _norm_path(folder) in boundaries:
+            # Reached the organizer's own output-tree structure with no usable
+            # label below it → no event; never mistake the target root or its
+            # Masters/Others/NoDate base folders for a label.
             return None
         if (not _is_unorganised_folder_name(name)  # date / serial / camera dump
                 and not _is_container_or_device(name)  # bucket / device / scratch
@@ -594,6 +613,7 @@ _PER_DAY_DOMINANCE = 0.90
 
 def _compute_event_groups(
     db: Database, stage_ids: set[int], scan_roots: list[Path] | None = None,
+    target_root: Path | None = None,
     overrides: dict | None = None, sibling_hints: dict | None = None,
 ) -> dict[str, dict]:
     """
@@ -639,7 +659,7 @@ def _compute_event_groups(
             dt, _used_mtime = _effective_date_with_override(row, overrides, sibling_hints)
             if dt is None:
                 continue
-            folder = _resolve_event_folder(Path(row["path"]), scan_roots)
+            folder = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
             if folder is None:
                 continue  # no real label → per-day / no-event fallback
             key = str(folder)
@@ -669,7 +689,8 @@ def _compute_event_groups(
 
 
 def detect_per_day_events(
-    db: Database, scan_roots: list[Path] | None = None, year: str | None = None,
+    db: Database, scan_roots: list[Path] | None = None,
+    target_root: Path | None = None, year: str | None = None,
 ) -> list[dict]:
     """DB-only. Find event-root folders already organized into per-day subfolders:
     >=2 photo subfolders, each >=_PER_DAY_DOMINANCE a single day, days spanning
@@ -704,7 +725,7 @@ def detect_per_day_events(
             sub = str(Path(row["path"]).parent)
             sub_dates[sub][dt.date()] += 1
             if sub not in sub_parent:
-                resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+                resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
                 sub_parent[sub] = str(resolved) if resolved else ""
 
     by_event: dict[str, list[tuple[str, date]]] = defaultdict(list)
@@ -748,6 +769,7 @@ def detect_per_day_events(
 
 def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = None,
                                   exclude: set[str] | None = None,
+                                  target_root: Path | None = None,
                                   year: str | None = None) -> list[dict]:
     """Event roots whose confident photos span multiple days with a SCATTERED /
     non-contiguous date profile (at least one adjacent-day gap > _EVENT_DAY_GAP)
@@ -774,7 +796,7 @@ def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = 
             dt = _parse_exif_dt(row["datetime_original"])
             if dt is None:
                 continue
-            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
             if resolved is None:
                 continue
             r = str(resolved)
@@ -800,7 +822,8 @@ def detect_multiday_needing_split(db: Database, scan_roots: list[Path] | None = 
 
 
 def detect_subjects_needing_confirmation(
-    db: Database, scan_roots: list[Path] | None = None, year: str | None = None,
+    db: Database, scan_roots: list[Path] | None = None,
+    target_root: Path | None = None, year: str | None = None,
 ) -> list[dict]:
     """Event roots that `_compute_event_groups` would auto-classify as a
     'subject' collection (named folder, confident-photo span > MAX_EVENT_SPAN_DAYS)
@@ -843,7 +866,7 @@ def detect_subjects_needing_confirmation(
             dt = _parse_exif_dt(row["datetime_original"])
             if dt is None:
                 continue
-            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
             if resolved is None:
                 continue
             r = str(resolved)
@@ -873,7 +896,8 @@ def detect_subjects_needing_confirmation(
 
 
 def _event_base_map(db: Database, known_cameras: set[str],
-                    scan_roots: list[Path] | None = None) -> dict[str, str]:
+                    scan_roots: list[Path] | None = None,
+                    target_root: Path | None = None) -> dict[str, str]:
     """resolved_event_folder(str) -> 'Masters' if ANY photo in that event has a
     known camera, else 'Others'. Used to co-locate videos under the same base as
     the event's photos. Photos only (RAW/CAMERA_JPEG/DEV_JPEG/HEIC) decide base."""
@@ -884,7 +908,7 @@ def _event_base_map(db: Database, known_cameras: set[str],
                 continue
             if row["file_type"] not in ("RAW", "CAMERA_JPEG", "DEV_JPEG", "HEIC"):
                 continue
-            resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+            resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
             if resolved is None:
                 continue
             key = str(resolved)
@@ -1375,7 +1399,7 @@ def _build_target_path(
 
     # ── Videos: co-locate with the event's photos (V3) ────────────────────────
     if row["file_type"] == "VIDEO":
-        resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+        resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
         group = (event_groups or {}).get(str(resolved)) if resolved else None
         event = _ov_event or (
             _sanitize_event(resolved.name, _group_date_range(group)) if resolved else ""
@@ -1407,7 +1431,7 @@ def _build_target_path(
     # ── Photos: event / subject folder, original filename preserved ──────────
     # The label comes from the RESOLVED event folder (climbs past camera-dump /
     # date-divider subfolders); falls back to "" (no label) when unresolved.
-    resolved = _resolve_event_folder(Path(row["path"]), scan_roots)
+    resolved = _resolve_event_folder(Path(row["path"]), scan_roots, target_root)
     group = (event_groups or {}).get(str(resolved)) if resolved else None
     event = _ov_event or (
         _sanitize_event(resolved.name, _group_date_range(group)) if resolved else ""
@@ -1703,7 +1727,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
     # destination folder (multi-day event, or year-subdivided subject collection).
     with console.status("Measuring event date spans…"):
         event_groups = _compute_event_groups(
-            db, stage_ids, scan_roots, overrides=folder_overrides,
+            db, stage_ids, scan_roots, target_root, overrides=folder_overrides,
             sibling_hints=sibling_hints,
         )
         db.commit()
@@ -1711,7 +1735,7 @@ def plan(db: Database, target_root: Path, force: bool = False,
     # Per-event base (Masters/Others), so a video co-locates under the SAME
     # base as its event's photos (V3) instead of following its own camera.
     with console.status("Mapping event folders to Masters/Others…"):
-        event_base = _event_base_map(db, known_cameras, scan_roots)
+        event_base = _event_base_map(db, known_cameras, scan_roots, target_root)
 
     for batch in db.iter_files():
         for row in batch:

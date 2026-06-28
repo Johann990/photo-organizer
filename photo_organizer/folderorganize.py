@@ -24,7 +24,7 @@ import webbrowser
 from collections import defaultdict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 from .db import Database
 from .planner import _is_unorganised_folder_name, _parse_exif_dt, _sanitize_event
@@ -233,7 +233,8 @@ class FolderOrganizeState:
     """Loaded once at server start: candidate folders needing attention."""
 
     def __init__(
-        self, db: Database, scan_roots: list | None = None, year: str | None = None,
+        self, db: Database, scan_roots: list | None = None,
+        target_root: Path | None = None, year: str | None = None,
     ) -> None:
         staged = {
             row[0] for row in
@@ -330,19 +331,23 @@ class FolderOrganizeState:
         # unbounded and climbs ABOVE the real scan root, so the "never treat a
         # scan root as an event" guard in both detect_* helpers never fires and
         # the suggestions diverge from what `plan` (which always passes roots)
-        # actually does. Forward the configured input_dirs.
+        # actually does. Forward the configured input_dirs. target_root is the
+        # same boundary on the OTHER end — without it, an already-organized
+        # file re-discovered inside the target tree could surface a phantom
+        # Masters/Others/NoDate suggestion that `plan` itself would never make.
         from .planner import (
             detect_multiday_needing_split,
             detect_per_day_events,
             detect_subjects_needing_confirmation,
         )
         self._overrides = overrides
-        self.per_day_candidates = detect_per_day_events(db, scan_roots, year=year)
+        self.per_day_candidates = detect_per_day_events(
+            db, scan_roots, target_root, year=year)
         _pd_roots = {c["event_folder"] for c in self.per_day_candidates}
         self.split_reminders = detect_multiday_needing_split(
-            db, scan_roots, exclude=_pd_roots, year=year)
+            db, scan_roots, exclude=_pd_roots, target_root=target_root, year=year)
         self.subject_candidates = detect_subjects_needing_confirmation(
-            db, scan_roots, year=year)
+            db, scan_roots, target_root, year=year)
 
     def _build_groups(self) -> list[dict]:
         """Group candidate folders by their parent ("mother") folder so runs
@@ -670,6 +675,7 @@ def serve(
     open_browser: bool = True,
     background: bool = False,
     scan_roots: list | None = None,
+    target_root: Path | None = None,
     year: str | None = None,
 ) -> ThreadingHTTPServer:
     """Start the local folder-organize review server.
@@ -681,10 +687,13 @@ def serve(
     scan_roots (the configured input_dirs) bounds event-folder resolution so the
     per-day suggestions match what `plan` produces; see FolderOrganizeState.
 
+    target_root (the configured --target) is the matching boundary on the
+    output side — see FolderOrganizeState.
+
     year (e.g. "2020") scopes candidates to one year at a time — batching P3
     triage instead of facing the whole library at once; see FolderOrganizeState.
     """
-    state = FolderOrganizeState(db, scan_roots, year)
+    state = FolderOrganizeState(db, scan_roots, target_root, year)
     httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     actual_port = httpd.server_address[1]
     url = f"http://{host}:{actual_port}/"

@@ -249,6 +249,9 @@ Common mappings / 常見對照：
 All commands accept `--config config.json` as an alternative to specifying individual flags.  
 所有命令都支援 `--config config.json`，作為個別旗標的替代方案。
 
+> This section covers the **core pipeline** commands. For the **complete 18-command reference** (incl. `add`, `sync`, `relocate`, `clone`, `reconcile`, `audit`, `folder-merge`, `timings`) see [`docs/COMMANDS.md`](docs/COMMANDS.md).  
+> 本節只列**核心流程**指令;**完整 18 個指令**(含 `add`、`sync`、`relocate`、`clone`、`reconcile`、`audit`、`folder-merge`、`timings`)見 [`docs/COMMANDS.md`](docs/COMMANDS.md)。
+
 ---
 
 ### `validate` — Pre-flight check / 正式執行前的驗證
@@ -309,7 +312,7 @@ python -m photo_organizer report --config config.json
 Prints a summary of everything in the database:  
 顯示資料庫中所有資料的摘要：
 
-- File type breakdown (RAW / CAMERA_JPEG / DEV_JPEG / RESIZED_JPEG / VIDEO / UNKNOWN)  
+- File type breakdown (RAW / CAMERA_JPEG / DEV_JPEG / RESIZED_JPEG / HEIC / VIDEO / UNKNOWN)  
   檔案類型分布（`DEV_JPEG` = RAW 沖出 / 軟體編輯過的 JPEG）
 - JPEG resolution distribution  
   JPEG 解析度分布
@@ -550,52 +553,66 @@ External Drive (slow)                    Local SSD (fast)
 E:\Organised\                          ← --target root
 │
 ├── Masters\                           ← Your own cameras (known_cameras)
-│   └── 2023\
-│       ├── 2023-06-15_3d_Kyoto\       ← multi-day event (2–30 days) — whole trip in ONE folder
-│       │   ├── DSC00001.ARW           ← ORIGINAL filename kept (no rename)
-│       │   ├── DSC00001.JPG           ← RAW+JPEG pair shares stem naturally
-│       │   └── DSC00050.ARW           ← files from all 3 days live here
-│       └── 2023-07-01_Picnic\         ← single-day event (no _Nd label)
-│           └── DSC00100.ARW
+│   ├── 2023\                          ← events filed by year
+│   │   ├── 2023-07-01 Picnic\         ← single-day:  {YYYY-MM-DD} {event}
+│   │   │   └── DSC00100.ARW           ← ORIGINAL filename kept (no rename)
+│   │   ├── 2023-06-15(3d) Kyoto\      ← multi-day (2–30 d):  {start}({N}d) {event}, whole trip in ONE folder
+│   │   │   ├── DSC00001.ARW           ← all 3 days live here; RAW+JPEG pair shares stem
+│   │   │   ├── DSC00001.JPG
+│   │   │   └── Videos\                ← event's videos co-locate here (no global tree)
+│   │   │       └── 2023-06-16_0001.MP4
+│   │   └── 2023-09-10(5d) Tour\       ← per-day split (opt-in via review --organize)
+│   │       ├── 0910\                  ← each file lands in {mmdd}/ by its own date
+│   │       │   └── DSC02000.ARW
+│   │       └── 0911\
+│   │           └── DSC02100.ARW
+│   └── Mei\                           ← subject collection: named folder, span > 30 days
+│       └── 2023\                      ← event-first then year, never split
+│           └── IMG_2001.HEIC          ← HEIC organised like a photo (full EXIF)
 │
 ├── Others\                            ← Other people's cameras
 │   └── 2023\
 │       └── 2023-08-01\                ← {event} omitted when no folder clue
 │           └── IMG_1234.JPG
 │
-├── NoDate\                            ← Files with no EXIF datetime
+├── NoDate\                            ← No EXIF date and no mtime fallback
 │   └── DSC09999.ARW
 │
-├── Videos\                            ← All videos (separate tree)
-│   ├── 2023\
-│   │   ├── 2023-08-15_Trip_Japan_0001.MP4   ← {event} = source parent folder
-│   │   └── 2023-08-15_0002.MP4              ← event omitted when unusable
+├── Videos\                            ← ONLY date-less videos (can't co-locate with an event)
 │   └── NoDate\
-│       └── Trip_Japan_0001.MP4
+│       └── video_0001.MP4
 │
 └── _staging\
-    ├── to_delete\                     ← Resized JPEGs + exact duplicates
-    │   ├── 42_IMG_resize_001.jpg      ← file_id prefix ensures no collision
-    │   └── 87_DSC00001.jpg
-    └── near_dupes\                    ← Near-duplicates from review command
-        └── 156_DSC00100.jpg
+    └── to_delete\                     ← safe deletion queue, split by stage_reason
+        ├── resized_jpeg\
+        │   └── 42_IMG_resize_001.jpg  ← {file_id}_ prefix avoids collisions
+        ├── exact_dupe\
+        ├── near_dupe\
+        ├── redundant_copy\
+        └── folder_merge\
 ```
 
 ### Photo Folder & Filename Format / 照片資料夾與檔名格式
 
 ```
-單日 / single-day:  {Masters|Others}\{YYYY}\{YYYY-MM-DD}_{event}\{original_filename}
-多天 / multi-day:   {Masters|Others}\{YYYY}\{start-date}_{N}d_{event}\{original_filename}
+單日 / single-day:  {Masters|Others}\{YYYY}\{YYYY-MM-DD} {event}\{original_filename}
+多天 / multi-day:   {Masters|Others}\{YYYY}\{start-date}({N}d) {event}\{original_filename}
+依日分夾 / per-day:  {Masters|Others}\{YYYY}\{start-date}({N}d) {event}\{mmdd}\{original_filename}
+主題 / subject:     {Masters|Others}\{event}\{YYYY}\{original_filename}
 
-例: Masters\2023\2023-06-15_3d_Kyoto\DSC00001.ARW   (3-day trip, all files here)
-    Masters\2023\2023-07-01_Picnic\DSC00100.ARW     (single day)
+例: Masters\2023\2023-07-01 Picnic\DSC00100.ARW         (single day)
+    Masters\2023\2023-06-15(3d) Kyoto\DSC00001.ARW      (3-day trip, all files here)
 無事件線索時 / when no event clue: Masters\2023\2023-06-15\DSC00001.ARW
 ```
 
 - Multi-day events (2–30 days sharing one source folder) collapse into a single folder named by start date + day count; span auto-computed from EXIF dates  
   多天活動（同一來源夾、2–30 天）收進單一資料夾，名稱用起始日+天數；跨度由 EXIF 日期自動計算
-- Source folders spanning > 30 days fall back to per-day folders (logged as WARN — likely a bulk dump)  
-  跨度 > 30 天的來源夾退回每日制（寫 WARN，多半是手機傾倒）
+- Named folder with span > 30 days → **subject collection** `{event}\{YYYY}\` (by year, never split); a date/serial-named folder > 30 days → per-day `{YYYY-MM-DD}\` fallback + WARN  
+  有事件名且跨度 > 30 天 → **主題收藏** `{event}\{YYYY}\`(依年份,不拆);只是日期/流水號名的夾 > 30 天 → 退回每日制 + WARN
+- **Per-day split (opt-in)**: a multi-day event can split into `{mmdd}\` subfolders by each file's own date, enabled in `review --organize`  
+  **依日分夾(選用)**:多天活動可在 `review --organize` 勾選,依每張照片自身日期分進 `{mmdd}\` 子夾
+- `HEIC` (iPhone) has full EXIF and is organised like a photo into Masters/Others  
+  `HEIC`(iPhone)有完整 EXIF,比照相片整理進 Masters/Others
 - Date from `DateTimeOriginal` EXIF field  
   日期來自 EXIF 的 `DateTimeOriginal`
 - `{event}` = sanitised source parent folder name; omitted when it is a drive root / empty  
@@ -608,18 +625,20 @@ E:\Organised\                          ← --target root
 #### Video Filename Format / 影片檔名格式
 
 ```
-{YYYY-MM-DD}_{event}_{seq:04d}.{EXT}
+{event-folder}\Videos\{date}_{seq:04d}.{EXT}     ← co-located in the event's own folder
 
-例: 2023-08-15_Trip_Japan_0001.MP4
-無事件線索時 / when no event clue: 2023-08-15_0001.MP4
+例: Masters\2023\2023-06-15(3d) Kyoto\Videos\2023-06-16_0001.MP4
+無日期 / no date: Videos\NoDate\video_0001.MP4
 ```
 
 - Date from `CreationDate` (Apple, with timezone) → `CreateDate` → `MediaCreateDate`  
   日期優先取 `CreationDate`（Apple，含時區）→ `CreateDate` → `MediaCreateDate`
 - `{event}` = sanitised source parent folder name; omitted when it is a drive root / empty  
   `{event}` = 來源父資料夾名（清理後）；若為碟機根目錄或空白則省略
-- Videos live in a separate `Videos/` tree with a year-only level (no `{YYYY-MM}`)  
-  影片放在獨立的 `Videos/` 樹，只分到年（無 `{YYYY-MM}` 層）
+- Videos co-locate in a `Videos\` subfolder of the **same event folder** their photos use (not a global tree); only date-less videos go to a global `Videos\NoDate\`  
+  影片放進**該事件資料夾的 `Videos\` 子夾**(不再用全域樹);只有無日期的影片進全域 `Videos\NoDate\`
+- `base` (Masters vs Others) follows the event's photos; the date order above resolves the filename `{date}`  
+  `base`(Masters/Others)跟著事件的照片走;檔名的 `{date}` 由上方日期順序決定
 
 ---
 
@@ -639,14 +658,14 @@ SQLite 資料庫（`photos.db`）是唯一的資料來源，可直接用任何 S
 | `filename` | TEXT | Filename only / 純檔名 |
 | `extension` | TEXT | Lowercase, no dot / 小寫，無點 |
 | `size_bytes` | INTEGER | File size / 檔案大小 |
-| `file_type` | TEXT | `RAW` / `CAMERA_JPEG` / `DEV_JPEG` / `RESIZED_JPEG` / `VIDEO` / `UNKNOWN` |
+| `file_type` | TEXT | `RAW` / `CAMERA_JPEG` / `DEV_JPEG` / `RESIZED_JPEG` / `HEIC` / `VIDEO` / `UNKNOWN` |
 | `datetime_original` | TEXT | EXIF DateTimeOriginal |
 | `camera_make` | TEXT | EXIF Make |
 | `camera_model` | TEXT | EXIF Model |
 | `width` / `height` | INTEGER | Native resolution / 原始解析度 |
 | `gps_lat` / `gps_lon` | REAL | GPS coordinates / GPS 座標 |
 | `sha256` | TEXT | Exact-dedup hash / 精確去重雜湊 |
-| `phash` | INTEGER | Perceptual hash / 感知雜湊 |
+| `phash` | TEXT | Perceptual hash — 16-char hex `str(imagehash.phash(img))` / 感知雜湊,16 字元 hex |
 | `rating` | INTEGER | 0–5 star rating from EXIF/XMP / 評分 |
 | `keywords` | TEXT | JSON array of keywords / 關鍵字 JSON 陣列 |
 | `description` | TEXT | EXIF/XMP description / 說明文字 |
@@ -656,7 +675,7 @@ SQLite 資料庫（`photos.db`）是唯一的資料來源，可直接用任何 S
 | `frame_rate` | REAL | Video frames per second (NULL for images) / 影片幀率（影像為 NULL）|
 | `raw_pair_id` | INTEGER FK | Linked RAW file (if this is JPEG) / 配對的 RAW |
 | `jpeg_pair_id` | INTEGER FK | Linked JPEG file (if this is RAW) / 配對的 JPEG |
-| `status` | TEXT | `pending` / `scanned` / `hashed` / `confirmed` / `done` / `error` |
+| `status` | TEXT | `pending` / `scanned` / `hashed` / `flagged` / `confirmed` / `done` / `error` |
 
 #### `duplicates` — Duplicate pairs / 重複配對
 

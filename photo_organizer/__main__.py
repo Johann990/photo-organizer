@@ -472,8 +472,9 @@ def cmd_review(args):
         elif getattr(args, "organize", False):
             from .folderorganize import serve as organize_serve
             scan_roots = cfg.input_dirs if (cfg and cfg.input_dirs) else None
+            target_root = cfg.target if cfg else None
             organize_serve(db, port=getattr(args, "port", 0), scan_roots=scan_roots,
-                           year=getattr(args, "year", None))
+                           target_root=target_root, year=getattr(args, "year", None))
         elif getattr(args, "web", False):
             from .webreview import serve
             serve(db, review_all=getattr(args, "all", False),
