@@ -1,6 +1,6 @@
 # Photo Organizer 指令手冊
 
-本文件目的:**查指令該怎麼用,不用回頭翻 code。** 完整的需求/架構說明見 [SKILL.md](../SKILL.md);各項設計決策的細節見 [CLAUDE.md](../CLAUDE.md)。
+本文件目的:**查指令該怎麼用,不用回頭翻 code。** 完整的需求/架構/設計決策說明見 [SKILL.md](../SKILL.md);專案規約與文件分工見 [CLAUDE.md](../CLAUDE.md)。
 
 > 共 18 個頂層指令(`review`、`sync` 各有多個子模式)。每個指令都接受 `--config config.json`(建議)或 `--db <path>` + 個別旗標。
 
@@ -20,7 +20,8 @@
    - [G. 復原誤搬誤刪](#g-復原誤搬誤刪)
    - [H. 選擇性分批執行](#h-選擇性分批執行)
 4. [各指令詳細參考](#各指令詳細參考)
-5. [常用查詢與慣例](#常用查詢與慣例)
+5. [`--force` 與已完成檔案的互動(重要)](#force-與已完成檔案的互動重要)
+6. [常用查詢與慣例](#常用查詢與慣例)
 
 ---
 
@@ -275,7 +276,7 @@ python -m photo_organizer execute --db C:\photos.db --type DEV_JPEG
 | `--web` | 縮圖網頁(取代終端機逐張看) |
 | `--auto [--commit]` | 自動解析明確案例,預設 dry-run 預覽 |
 | `--folders` | 改審查雙胞胎資料夾(`folder-merge` 的結果) |
-| `--organize [--year YYYY]` | 事件名/日期/per-day/subject 標註,見情境 F |
+| `--organize [--year YYYY]` | 事件名/日期/per-day/subject 標註,見情境 F(候選含已整理好的資料夾,不限來源) |
 | `--all` | 手動審查時也走訪連拍叢集(預設跳過,直接保留) |
 | `--port N` | `--web`/`--folders` 綁定埠號(預設隨機) |
 
@@ -289,11 +290,27 @@ python -m photo_organizer execute --db C:\photos.db --type DEV_JPEG
 | `--dates-only` | 只跑日期鑑識,不建計畫、不需 target(DB-only) |
 | `--yes` | 跳過互動確認,自動確認計畫 |
 
-`--force` 會清掉 `planned`/`confirmed` 的計畫重建,**不動 `done`**(已落地的不受影響)。
+`--force` 只清掉 `operations` 裡 `planned`/`confirmed` 的列,**不刪除已存在的 `done` 列**;但它**不是**單純「不影響 done」——完整機制(計畫迴圈會重掃含 `done` 的全部檔案、可能覆寫 `files.status`)與何時真的需要,集中見〈[`--force` 與已完成檔案的互動](#force-與已完成檔案的互動重要)〉,本處不重述。
+
+**日期鑑識解析階梯**(`plan --dates-only` 或 `plan` 前自動跑，DB-only，idempotent；先符合者勝):
+
+| 步驟 | 條件 | `date_source` | `date_confidence` |
+|---|---|---|---|
+| 1 | 有相機型號 + DateTimeOriginal 合理 | `exif_original` | **HIGH** |
+| 2 | DateTimeOriginal 與檔名日期相差 ≤ ~1 天 | `exif_original` | **HIGH** |
+| 3 | 檔名日期合理但與 DateTimeOriginal 相差 > ~2 天 | `filename` | **LOW** |
+| 4 | DateTimeOriginal 合理但無佐證、無相機 | `exif_original` | **MEDIUM** |
+| 5 | DateTimeDigitized 合理 | `exif_digitized` | **MEDIUM** |
+| 6 | 退回 mtime | `mtime` | **LOW** |
+| 7 | 都沒有 | — | → `NoDate/` |
+
+合理性界線(踩到即降 LOW / 列入可疑):未來日期、年份 < 1990、哨兵值 `1980-01-01` / `2000-01-01`。  
+檔名日期格式涵蓋:`IMG_YYYYMMDD`、`PXL_YYYYMMDD_HHMMSSsss`、`VID_…`、`Screenshot_…`(Android)、`IMG-YYYYMMDD-WA####`(WhatsApp)、`Signal-YYYY-MM-DD-…`、裸 `YYYYMMDD_######`。  
+可疑日期寫進 `run_log`(phase=`review`)：`SELECT path, message FROM run_log WHERE phase='review' AND message LIKE 'Suspicious-date%';`
 
 ### `execute` — Phase 5
 **何時用**:`plan` 確認之後。**真正搬檔的指令,小心使用。**
-篩選旗標(可組合,見情境 H):`--year` `--camera` `--software` `--type`;`--skip-preflight` 跳過同碟檢查(進階用戶)。
+篩選旗標(可組合,見情境 H):`--year` `--camera` `--software` `--type`;`--skip-preflight` 跳過同碟檢查(進階用戶)。只處理 `status IN ('confirmed', 'in_progress')` 的 op,從不重碰已 `done` 的(但此保護僅 op 層級,擋不住 `plan --force` 另生新 op——見〈[`--force` 與已完成檔案的互動](#force-與已完成檔案的互動重要)〉)。
 
 ### `add`
 **何時用**:庫已整理好,要加新照片進來(見情境 B)。
@@ -308,6 +325,8 @@ python -m photo_organizer execute --db C:\photos.db --type DEV_JPEG
 ### `undo`
 **何時用**:誤搬、誤判要刪、或 `sync` 校正錯了,想復原(見情境 G)。
 篩選旗標跟 `execute` 一致,多一個 `--op-type`(如 `STAGE_DELETE`/`MOVE`/`RENAME`)。**絕不覆蓋**已佔用的原位置。
+
+`undo` 的 `--force` 跟其他指令語意不同(無 phase 完成檢查)——純粹是跳過互動確認 `Proceed with undo? [y/N]`;在終端機裡互動跑,不加 `--force` 一樣會動,只是會停下來等你輸入 `y`。**非互動 shell**(腳本/排程,沒有終端機可回答)則一定要加 `--force`,否則直接拒絕執行(`input()` 會永遠卡住等不到輸入)。
 
 ### `sync`(三個子指令,見情境 D)
 | 子指令 | 何時用 | 可逆? |
@@ -361,6 +380,33 @@ python -m photo_organizer execute --db C:\photos.db --type DEV_JPEG
 
 ---
 
+## `--force` 與已完成檔案的互動(重要)
+
+`plan` 的計畫迴圈用 `db.iter_files()` 掃描**整張 `files` 表**,只跳過 `status='error'`——**不會排除已經 `done` 的檔案**。確認計畫時這行也是無條件執行:
+
+```sql
+UPDATE files SET status = 'confirmed'
+WHERE file_id IN (SELECT file_id FROM operations WHERE status = 'confirmed')
+```
+
+所以只要某個已 `done` 的檔案這次重算出新的 op,它的 `status` 會被**覆寫回 `confirmed`**。重算出的目的地恰好沒變(已正確歸位的檔案多半如此)時,下次 `execute` 只是把檔案 rename 回自己原路徑,無害但浪費時間;但只要解析結果**不一樣**(改了 code/config/override 後常見),下次 `execute` 就會真的把已經整理好的檔案再搬一次,而且系統不會主動警告你。
+
+**`execute` 本身是安全的**:它撈取要處理的 op 用 `WHERE o.status IN ('confirmed', 'in_progress')`,從不重碰 `status='done'` 的 op。但這個保護是**op 層級**,擋不住 `plan --force` 幫同一個檔案另外生出一筆新的 `confirmed` op——`execute` 沒有辦法知道「這個檔案其他地方已經有一筆 done 了」。
+
+**`review --organize` 同理不分 done/未 done**:它讀的是 `files.path`,而這一欄在 `execute` 時會被原地覆寫成目的地(`UPDATE files SET status='done', path=<目的地> ...`)。同一段程式碼,done 前讀到的是來源路徑,done 後讀到的是已整理路徑——這是刻意設計(讓你能回頭幫已整理好的無事件資料夾補事件名),不是 bug,但代表它列出的候選資料夾**不保證是還沒整理的**。
+
+**什麼時候真的需要 `plan --force`**(否則別用,尤其手上還有一大批 `confirmed` 還沒 `execute` 完時):
+- 在原本的 `plan` 之後又跑了 `review`(近似重複審查),新決策要變成真的 `STAGE_DELETE`
+- `review --organize` 填了新的 event/date override、勾了 per-day-split、確認了 subject
+- `known_cameras` 設定變了(新增相機型號)
+- 手動拆/併資料夾 + `relocate` 之後,要重新計算事件分組
+- 改了 planner 的程式邏輯,且想讓修正套用到還沒執行的計畫
+- 換了 `dedup` 設定(如 `--hamming`)重新產生不同的重複分組
+
+最安全的時機:**剛做完上述變更、準備一次性重新預覽 + 確認 + 執行整批**的時候——不是在一個很大的 `confirmed` 計畫還卡在半路時。
+
+---
+
 ## 常用查詢與慣例
 
 ```sql
@@ -383,4 +429,4 @@ SELECT * FROM files WHERE path LIKE '<folder>%';
 
 **DB 路徑解析順序**(所有指令一致):`--db` 明確指定 > config 裡的 `db` > `{target}/.photo_organizer/library.db` 預設值。
 
-**`--force` 的意義依指令不同**:對 `plan` 是「丟掉 pending 計畫重算」;對 `scan`/`dedup`/`report` 等是「即使該 phase 已標完成也重跑」;**永遠不影響已經 `done` 的列**。
+**`--force` 的意義依指令不同**:對 `scan`/`dedup`/`report`/`execute` 是「即使該 phase 已標完成也重跑」;對 `plan` 是「丟掉 pending 計畫重算」,但**會連已 `done` 的檔案一起重新掃過**(細節見〈[`--force` 與已完成檔案的互動](#force-與已完成檔案的互動重要)〉);對 `undo` 則完全不同——**沒有 phase 完成檢查**,純粹是跳過互動確認 `[y/N]` 提示,只在非互動 shell(腳本/排程)下才是必須的,否則會直接拒絕執行。
